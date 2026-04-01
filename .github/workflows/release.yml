@@ -42,6 +42,11 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       # Help debug what exact was input for this since Github doesn't expose it.
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - name: Output Inputs
         run: echo "${{ toJSON(github.event.inputs) }}"
       - name: Set canonical VERSION
@@ -76,6 +81,11 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - name: Prepare
       run: |
         platform=${{ matrix.platform }}
@@ -88,18 +98,18 @@ jobs:
         images: ${{ env.REGISTRY_IMAGE }}
 
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
     - name: Build and push by digest
       id: build
-      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      uses: step-security/docker-build-push-action@a8c3d08b23f8be6aeed43eb1a14ce6fe51284438 # v6.18.0
       with:
         build-args: |
           VERSION=${{ env.VERSION }}
@@ -137,8 +147,13 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: step-security/cosign-installer@9610e5af306c47db1756d9e09a0388449e336ab7 # v4.0.0
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -148,14 +163,14 @@ jobs:
           merge-multiple: true
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
       - name: Docker meta
         id: meta
@@ -201,6 +216,11 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - name: Prepare
       run: |
         platform=${{ matrix.platform }}
@@ -213,7 +233,7 @@ jobs:
         images: ${{ env.REGISTRY_IMAGE }}-musl
 
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -221,11 +241,11 @@ jobs:
 
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
     - name: Build and push by digest
       id: build
-      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      uses: step-security/docker-build-push-action@a8c3d08b23f8be6aeed43eb1a14ce6fe51284438 # v6.18.0
       with:
         platforms: ${{ matrix.platform }}
         labels: ${{ steps.meta.outputs.labels }}
@@ -264,8 +284,13 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: step-security/cosign-installer@9610e5af306c47db1756d9e09a0388449e336ab7 # v4.0.0
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -275,14 +300,14 @@ jobs:
           merge-multiple: true
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
       - name: Docker meta
         id: meta
@@ -333,6 +358,11 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - name: Prepare
       run: |
         platform=${{ matrix.platform }}
@@ -342,7 +372,7 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -372,11 +402,11 @@ jobs:
         images: ${{ env.CONTROLLER_REGISTRY_IMAGE }}
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
     - name: Build and push by digest
       id: build
-      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      uses: step-security/docker-build-push-action@a8c3d08b23f8be6aeed43eb1a14ce6fe51284438 # v6.18.0
       with:
         context: controller/_output/pkg/agentgateway
         file: controller/_output/pkg/agentgateway/Dockerfile.agentgateway
@@ -415,8 +445,13 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: step-security/cosign-installer@9610e5af306c47db1756d9e09a0388449e336ab7 # v4.0.0
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -433,14 +468,14 @@ jobs:
           find . -type f
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: step-security/docker-login-action@6aa05fe688caf2c58e784663f01b3415ced503e8 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
 
       - name: Docker meta
         id: meta
@@ -480,6 +515,11 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Helm login to ${{ env.CHART_REGISTRY_IMAGE_BASE }}
@@ -517,6 +557,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             features: default
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - name: Checkout Repository
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -569,6 +614,11 @@ jobs:
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - name: Download Artifacts
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
@@ -587,7 +637,7 @@ jobs:
         mv release-binary-windows-2025/agentgateway.exe outputs/agentgateway-windows-amd64.exe
         sha256sum outputs/agentgateway-windows-amd64.exe > outputs/agentgateway-windows-amd64.exe.sha256
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+      uses: step-security/action-gh-release@dc29ef0d1f6f9a032a97ec797d9cb7ea788dde41 # v2.6.1
       with:
         files: outputs/agentgateway-*
         tag_name: ${{ github.ref_name }}

@@ -32,12 +32,17 @@ jobs:
           validate: false
     runs-on: ${{ matrix.os }}
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Install Rust
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
       with:
         toolchain: "${{ env.RUST_VERSION }}"
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+    - uses: step-security/rust-cache@9be15b830520fab0ec3939586e917e4855cf76bd # v2.8.3
       # Github cache is too tiny to handle the full matrix :-(
       if: ${{ startsWith(matrix.os, 'ubuntu-') }}
       with:
@@ -54,12 +59,17 @@ jobs:
   proxy-lint:
     runs-on: ubuntu-24.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Install Rust
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
       with:
         toolchain: "${{ env.RUST_VERSION }}"
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+    - uses: step-security/rust-cache@9be15b830520fab0ec3939586e917e4855cf76bd # v2.8.3
       with:
         # Github cache will restore from 'main' OR the current branch.
         # If we cache PR branches, we may evict the 'main' cache and end up with no cache hits at all.
@@ -77,6 +87,11 @@ jobs:
       run:
         working-directory: ui
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
       with:
@@ -90,6 +105,11 @@ jobs:
   controller-test:
     runs-on: ubuntu-24.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
       with:
@@ -103,6 +123,11 @@ jobs:
   controller-lint:
     runs-on: ubuntu-24.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
       with:
@@ -123,6 +148,11 @@ jobs:
   controller-e2e:
     runs-on: ubuntu-24.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Check Runner Info
       run: |
@@ -134,7 +164,7 @@ jobs:
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
       with:
         toolchain: "${{ env.RUST_VERSION }}"
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+    - uses: step-security/rust-cache@9be15b830520fab0ec3939586e917e4855cf76bd # v2.8.3
       with:
         # Github cache will restore from 'main' OR the current branch.
         # If we cache PR branches, we may evict the 'main' cache and end up with no cache hits at all.
@@ -175,12 +205,17 @@ jobs:
   controller-conformance:
     runs-on: ubuntu-24.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Install Rust
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
       with:
         toolchain: "${{ env.RUST_VERSION }}"
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+    - uses: step-security/rust-cache@9be15b830520fab0ec3939586e917e4855cf76bd # v2.8.3
       with:
         # We only read the cache from 'E2E' job, since they should have identical cache.
         save-if: "false"
