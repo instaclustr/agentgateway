@@ -9,12 +9,13 @@ use std::str::FromStr;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use sha1::{Digest, Sha1};
+use subtle::ConstantTimeEq;
 
 use crate::md5::APR1_ID;
 
 pub mod md5;
 
-static BCRYPT_ID: &str = "$2y$";
+static BCRYPT_IDS: [&str; 4] = ["$2a$", "$2b$", "$2x$", "$2y$"];
 static SHA1_ID: &str = "{SHA}";
 
 pub struct Htpasswd<'a>(HashMap<Cow<'a, str>, Hash<'a>>);
@@ -71,13 +72,19 @@ fn parse_hash_entry(entry: &'_ str) -> Option<(Cow<'_, str>, Hash<'_>)> {
 	Hash::parse(hash_id).map(|hash| (Cow::Borrowed(username), hash))
 }
 
+/// Compares two hash encodings in constant time, so an attacker cannot learn how many
+/// leading bytes of the computed hash match the stored one through response timing.
+fn constant_time_eq(computed: &str, stored: &str) -> bool {
+	computed.as_bytes().ct_eq(stored.as_bytes()).into()
+}
+
 impl<'a> Hash<'a> {
 	pub fn check<S: AsRef<str>>(&self, password: S) -> bool {
 		let password = password.as_ref();
 		match self {
-			Hash::MD5(hash) => md5::md5_apr1_encode(password, &hash.salt).as_str() == hash.hash,
+			Hash::MD5(hash) => constant_time_eq(&md5::md5_apr1_encode(password, &hash.salt), &hash.hash),
 			Hash::BCrypt(hash) => bcrypt::verify(password, hash).unwrap_or(false),
-			Hash::SHA1(hash) => BASE64_STANDARD.encode(Sha1::digest(password)).as_str() == *hash,
+			Hash::SHA1(hash) => constant_time_eq(&BASE64_STANDARD.encode(Sha1::digest(password)), hash),
 			Hash::Crypt(hash) => pwhash::unix_crypt::verify(password, hash),
 		}
 	}
@@ -94,7 +101,7 @@ impl<'a> Hash<'a> {
 				salt: Cow::Borrowed(salt),
 				hash: Cow::Borrowed(digest),
 			}))
-		} else if hash.starts_with(BCRYPT_ID) {
+		} else if BCRYPT_IDS.iter().any(|id| hash.starts_with(id)) {
 			bcrypt::HashParts::from_str(hash)
 				.ok()
 				.map(|_| Hash::BCrypt(Cow::Borrowed(hash)))
@@ -128,6 +135,7 @@ mod tests {
 
 	static DATA: &str = "user2:$apr1$7/CTEZag$omWmIgXPJYoxB3joyuq4S/
 user:$apr1$lZL6V/ci$eIMz/iKDkbtys/uU7LEK00
+longpassword:$apr1$5jJtzRYw$xQlupJ3AHTXrqQiCyLBwY1
 bcrypt_test:$2y$05$nC6nErr9XZJuMJ57WyCob.EuZEjylDt2KaHfbfOtyb.EgL1I2jCVa
 sha1_test:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=
 crypt_test:bGVh02xkuGli2";
@@ -142,6 +150,8 @@ crypt_test:bGVh02xkuGli2";
 	fn sha1_verify_htpasswd() {
 		let htpasswd = Htpasswd::new(DATA);
 		assert!(htpasswd.check("sha1_test", "password"));
+		assert!(!htpasswd.check("sha1_test", "passwort"));
+		assert!(!htpasswd.check("sha1_test", ""));
 	}
 
 	#[test]
@@ -151,12 +161,24 @@ crypt_test:bGVh02xkuGli2";
 	}
 
 	#[test]
+	fn bcrypt_verify_non_2y_prefixes() {
+		let htpasswd = Htpasswd::new(
+			"bcrypt_2a:$2a$04$UuTkLRZZ6QofpDOlMz32MuuxEHA43WOemOYHPz6.SjsVsyO1tDU96\n\
+			 bcrypt_2b:$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie",
+		);
+		assert!(htpasswd.check("bcrypt_2a", "password"));
+		assert!(htpasswd.check("bcrypt_2b", "correctbatteryhorsestapler"));
+	}
+
+	#[test]
 	fn md5_verify_htpasswd() {
 		let htpasswd = Htpasswd::new(DATA);
 		assert!(htpasswd.check("user", "password"));
 		assert!(!htpasswd.check("user", "passwort"));
 		assert!(htpasswd.check("user2", "zaq1@WSX"));
 		assert!(!htpasswd.check("user2", "ZAQ1@WSX"));
+		assert!(htpasswd.check("longpassword", "password-longer-than-16-chars"));
+		assert!(!htpasswd.check("longpassword", "passwort-longer-than-16-chars"));
 	}
 
 	#[test]
@@ -167,6 +189,17 @@ crypt_test:bGVh02xkuGli2";
 				"xxxxxxxx",
 			),
 			"$apr1$xxxxxxxx$dxHfLAsjHkDRmG83UXe8K0".to_string()
+		);
+	}
+
+	#[test]
+	fn md5_apr1_password_longer_than_digest() {
+		assert_eq!(
+			md5::format_hash(
+				md5::md5_apr1_encode("12345678901234567", "xxxxxxxx").as_str(),
+				"xxxxxxxx",
+			),
+			"$apr1$xxxxxxxx$e9cFJu9y.UyLugYQA0cNc1".to_string()
 		);
 	}
 

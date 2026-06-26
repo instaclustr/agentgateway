@@ -26,6 +26,64 @@ fn eval_request(expr: &str, req: crate::http::Request) -> Result<Value, Error> {
 }
 
 #[test]
+fn custom_functions_eval_and_register_from_config() {
+	let config = crate::config::parse_config(
+		r#"
+config:
+  customFunctions: |
+    agwCustomHi() { "hi" }
+    agwCustomAdd(a, b) { a + b }
+    this.agwCustomMix(a, rest...) { this + a + rest[0] + rest[1] }
+    agwCustomIsGet() { request.method == "GET" }
+    agwCustomNestedIsGet() { agwCustomIsGet() }
+    agwCustomFromConfig(name) { "hello " + name }
+"#
+		.to_string(),
+		None,
+	);
+	if let Err(err) = config {
+		assert!(
+			err
+				.to_string()
+				.contains("custom CEL functions must be registered before CEL is used"),
+			"unexpected custom function registration error: {err}"
+		);
+		return;
+	}
+
+	assert_eq!(eval("agwCustomHi()").unwrap(), json!("hi"));
+	assert_eq!(eval("agwCustomAdd(2, 3)").unwrap(), json!(5));
+	assert_eq!(
+		eval(r#""a".agwCustomMix("b", "c", "d")"#).unwrap(),
+		json!("abcd")
+	);
+
+	let exp = Expression::new_strict("agwCustomNestedIsGet()").unwrap();
+	let mut cb = ContextBuilder::new();
+	cb.register_expression(&exp);
+	let mut req = ::http::Request::builder()
+		.method(Method::GET)
+		.body(Body::empty())
+		.unwrap();
+	assert!(cb.maybe_snapshot_request(&mut req, false).is_some());
+
+	let exec = Executor::new_request(&req);
+	assert_eq!(exec.eval(&exp).unwrap().json().unwrap(), json!(true));
+
+	assert_eq!(
+		eval(r#"agwCustomFromConfig("world")"#).unwrap(),
+		json!("hello world")
+	);
+
+	let err = register_custom_functions("agwCustomTooLate() { true }").unwrap_err();
+	assert!(
+		err
+			.to_string()
+			.contains("custom CEL functions must be registered before CEL is used")
+	);
+}
+
+#[test]
 fn test_permissive() {
 	let exec_serde = full_example_executor();
 	let exec = exec_serde.as_executor();
@@ -98,7 +156,7 @@ async fn log_only_request_body_records_without_buffering() {
 	let sent = body.collect().await.unwrap().to_bytes();
 	assert_eq!(sent, bytes::Bytes::from_static(b"hello"));
 
-	let exec = Executor::new_logger(Some(&snapshot), None, None, None, None);
+	let exec = Executor::new_logger(Some(&snapshot), None, None, None, None, None);
 	assert_eq!(
 		helpers::value_as_byte_or_json(exec.eval(&exp).unwrap()).unwrap(),
 		bytes::Bytes::from_static(b"hello")
@@ -157,7 +215,7 @@ async fn log_only_response_body_records_without_buffering() {
 	let sent = body.collect().await.unwrap().to_bytes();
 	assert_eq!(sent, bytes::Bytes::from_static(b"world"));
 
-	let exec = Executor::new_logger(None, Some(&snapshot), None, None, None);
+	let exec = Executor::new_logger(None, Some(&snapshot), None, None, None, None);
 	assert_eq!(
 		helpers::value_as_byte_or_json(exec.eval(&exp).unwrap()).unwrap(),
 		bytes::Bytes::from_static(b"world")
@@ -351,6 +409,15 @@ fn api_key_secret_is_redacted_by_default() {
 	assert_eq!(
 		json!("test-api-key-id"),
 		eval("apiKey.key.unredacted()").unwrap()
+	);
+}
+
+#[test]
+fn jwt_token_is_redacted_by_default() {
+	assert_eq!(json!("<redacted>"), eval("jwt.rawToken").unwrap());
+	assert_eq!(
+		json!("fake.jwt.token"),
+		eval("jwt.rawToken.unredacted()").unwrap()
 	);
 }
 

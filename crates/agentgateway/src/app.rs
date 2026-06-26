@@ -31,7 +31,7 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	let proxy_task = ready.register_task("agentgateway");
 
 	let readiness_server = crate::management::readiness_server::Server::new(
-		config.readiness_addr,
+		config.readiness_addr.clone(),
 		drain_rx.clone(),
 		ready.clone(),
 	)
@@ -91,6 +91,8 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 
 	state_manager::start_self_workload_resolution(&config, stores.clone(), &ready);
 
+	let model_catalog = crate::llm::cost::ModelCatalog::new(config.model_catalog.sources.clone())?;
+
 	let mut xds_rx_for_task = xds_rx.clone();
 	tokio::spawn(async move {
 		// When we get the initial XDS state, unblock readiness
@@ -100,9 +102,9 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	// Run the XDS state manager in the current tokio worker pool.
 	tokio::spawn(state_mgr.run());
 
-	#[allow(unused_mut)]
-	let mut admin_server = crate::management::admin::Service::new(
+	let admin_server = crate::management::admin::Service::new(
 		config.clone(),
+		model_catalog.clone(),
 		stores.clone(),
 		shutdown.trigger(),
 		drain_rx.clone(),
@@ -111,14 +113,14 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	.await
 	.context("admin server starts")?;
 	#[cfg(feature = "ui")]
-	admin_server.set_admin_handler(Arc::new(crate::ui::UiHandler::new(config.clone())));
-	#[cfg(feature = "ui")]
 	info!("serving UI at http://{}/ui", config.admin_addr);
 
 	let pi = ProxyInputs {
 		cfg: config.clone(),
 		stores: stores.clone(),
 		metrics: metrics_handle.clone(),
+		model_catalog,
+		admin: Some(admin_server.service()),
 		upstream: client.clone(),
 		ca,
 
@@ -146,10 +148,13 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	admin_server.spawn();
 
 	// Create and start the metrics server.
-	let metrics_server =
-		crate::management::metrics_server::Server::new(config.stats_addr, drain_rx.clone(), registry)
-			.await
-			.context("stats server starts")?;
+	let metrics_server = crate::management::metrics_server::Server::new(
+		config.stats_addr.clone(),
+		drain_rx.clone(),
+		registry,
+	)
+	.await
+	.context("stats server starts")?;
 	// Run the metrics sever in the current tokio worker pool.
 	metrics_server.spawn();
 	Ok(Bound {

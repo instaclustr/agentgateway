@@ -1,14 +1,17 @@
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use ::http::{Method, Version, header};
+use ::http::{HeaderMap, Method, StatusCode, Version, header};
 use agent_core::strng;
 use assert_matches::assert_matches;
-use http_body_util::BodyExt;
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
 use hyper::client::conn::http1;
+use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ppp::v2::{
@@ -28,16 +31,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use x509_parser::nom::AsBytes;
 
 use crate::http::tests_common::*;
-use crate::http::{Body, Response};
-use crate::llm::{AIProvider, openai};
+use crate::http::{Body, Response, ext_proc};
+use crate::llm::{AIProvider, custom, gemini, openai};
 use crate::proxy::request_builder::RequestBuilder;
 use crate::test_helpers::proxymock::*;
 use crate::test_helpers::{extauthmock, oteltracemock, ratelimitmock};
 use crate::types::agent::{
-	Backend, BackendTrafficPolicy, BackendWithPolicies, Bind, BindProtocol, Listener,
-	ListenerProtocol, ListenerSet, PathMatch, ResourceName, Route, RouteMatch, Target,
+	Backend, BackendTarget, BackendTrafficPolicy, BackendWithPolicies, Bind, BindProtocol,
+	FrontendPolicy, Listener, ListenerProtocol, ListenerSet, ListenerTarget, PathMatch,
+	PolicyInheritance, PolicyTarget, ResourceName, Route, RouteMatch, SimpleBackendReference, Target,
+	TargetedPolicy, TunnelProtocol,
 };
-use crate::types::backend;
+use crate::types::{backend, frontend};
 use crate::{read_body, *};
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -141,6 +146,7 @@ fn https_bind() -> Bind {
 			hostname: strng::new("*.example.com"),
 			protocol: ListenerProtocol::HTTPS(
 				types::local::LocalTLSServerConfig {
+					mode: Default::default(),
 					cert: "../../examples/tls/certs/cert.pem".into(),
 					key: "../../examples/tls/certs/key.pem".into(),
 					root: None,
@@ -242,6 +248,36 @@ fn build_proxy_v2_header(src: &str, dst: &str) -> Vec<u8> {
 	.unwrap()
 }
 
+async fn raw_header_backend() -> (std::net::SocketAddr, oneshot::Receiver<String>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let (tx, rx) = oneshot::channel();
+	tokio::spawn(async move {
+		let (mut stream, _) = listener.accept().await.unwrap();
+		let mut buf = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = stream.read(&mut chunk).await.unwrap();
+			assert!(
+				n > 0,
+				"raw header backend connection closed before request headers"
+			);
+			buf.extend_from_slice(&chunk[..n]);
+			if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+		tx.send(String::from_utf8(buf[..header_end].to_vec()).unwrap())
+			.unwrap();
+		stream
+			.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+	});
+	(addr, rx)
+}
+
 async fn oidc_backend_mock() -> (MockServer, Arc<StdMutex<Option<String>>>) {
 	let token_response = Arc::new(StdMutex::new(None));
 	let mock = MockServer::start().await;
@@ -281,6 +317,42 @@ async fn basic_handling() {
 	let body = read_body(res.into_body()).await;
 	assert_eq!(body.version, Version::HTTP_11);
 	assert_eq!(body.method, Method::POST);
+}
+
+#[tokio::test]
+async fn http_header_case_preserve_forwards_original_case_to_backend() {
+	let (backend_addr, captured_request) = raw_header_backend().await;
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(backend_addr)
+		.with_bind(simple_bind())
+		.with_route(basic_route(backend_addr));
+	t.attach_frontend_policy(json!({
+		"http": {
+			"http1HeaderCase": "preserve",
+		},
+	}))
+	.await;
+
+	let mut io = t.serve(BIND_KEY);
+	io.write_all(
+		b"GET / HTTP/1.1\r\nHost: lo\r\nX-Case-Probe: preserve-me\r\nConnection: close\r\n\r\n",
+	)
+	.await
+	.unwrap();
+
+	let captured_request = tokio::time::timeout(Duration::from_secs(5), captured_request)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(
+		captured_request.contains("\r\nX-Case-Probe: preserve-me\r\n"),
+		"backend request did not preserve header case:\n{captured_request}"
+	);
+	assert!(
+		!captured_request.contains("\r\nx-case-probe: preserve-me\r\n"),
+		"backend request lowercased preserved header:\n{captured_request}"
+	);
 }
 
 #[tokio::test]
@@ -527,6 +599,78 @@ async fn basic_http2() {
 	assert_eq!(read_body(res.into_body()).await.version, Version::HTTP_2);
 }
 
+async fn grpc_trailer_backend(status: &'static str) -> std::net::SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((stream, _)) = listener.accept().await else {
+				return;
+			};
+			tokio::spawn(async move {
+				let svc = service_fn(move |_| async move {
+					let mut trailers = HeaderMap::new();
+					trailers.insert("grpc-status", status.parse().unwrap());
+					let body = StreamBody::new(tokio_stream::iter([
+						Ok::<_, Infallible>(Frame::data(bytes::Bytes::new())),
+						Ok(Frame::trailers(trailers)),
+					]));
+					Ok::<_, Infallible>(
+						::http::Response::builder()
+							.status(200)
+							.header(header::CONTENT_TYPE, "application/grpc")
+							.body(body)
+							.unwrap(),
+					)
+				});
+				let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+					.serve_connection(TokioIo::new(stream), svc)
+					.await;
+			});
+		}
+	});
+	addr
+}
+
+#[tokio::test]
+async fn grpc_status_trailer_is_available_to_access_log_cel() {
+	let backend = grpc_trailer_backend("13").await;
+	let path = format!("/grpc-{}", rand::rng().random::<u128>());
+	let t = setup_proxy_test(
+		r#"{"config":{"logging":{"fields":{"add":{"cel_grpc_status":"response.grpcStatus"}}}}}"#,
+	)
+	.unwrap()
+	.with_raw_backend(BackendWithPolicies {
+		backend: Backend::Opaque(
+			ResourceName::new(strng::format!("{}", backend), "".into()),
+			Target::Address(backend),
+		),
+		inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+			version: Some(Version::HTTP_2),
+			..Default::default()
+		})],
+	})
+	.with_bind(simple_bind())
+	.with_route(basic_route(backend));
+	let io = t.serve_http2(strng::new("bind"));
+	let res = RequestBuilder::new(Method::POST, &format!("http://lo{path}"))
+		.version(Version::HTTP_2)
+		.header(header::CONTENT_TYPE, "application/grpc")
+		.body(Body::empty())
+		.send(io)
+		.await
+		.unwrap();
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	let log =
+		agent_core::telemetry::testing::eventually_find(&[("scope", "request"), ("http.path", &path)])
+			.await
+			.unwrap();
+	assert_eq!(log["grpc.status"].as_u64(), Some(13));
+	assert_eq!(log["cel_grpc_status"].as_u64(), Some(13));
+}
+
 #[tokio::test]
 async fn reserved_oidc_cookies_are_stripped_before_proxying() {
 	let mock = simple_mock().await;
@@ -685,6 +829,63 @@ async fn gateway_phase_oidc_bypasses_cors_preflight_requests() {
 	assert_eq!(res.status(), 200);
 	let body = read_body(res.into_body()).await;
 	assert_eq!(body.method, Method::OPTIONS);
+}
+
+#[tokio::test]
+async fn gateway_phase_cors_handles_preflight_before_route_selection() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_gateway_policy(json!({
+			"cors": {
+				"allowCredentials": false,
+				"allowHeaders": ["*"],
+				"allowMethods": ["GET", "POST"],
+				"allowOrigins": ["http://example.com"],
+				"exposeHeaders": [],
+			},
+		}))
+		.await;
+
+	let res = send_request_headers(
+		io,
+		Method::OPTIONS,
+		"http://lo/no-route-needed",
+		&[
+			("origin", "http://example.com"),
+			("access-control-request-method", "GET"),
+		],
+	)
+	.await;
+
+	assert_eq!(res.status(), 200);
+	assert_eq!(res.hdr("access-control-allow-origin"), "http://example.com");
+}
+
+#[tokio::test]
+async fn gateway_phase_authorization_runs_before_route_selection() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_gateway_policy(json!({
+			"authorization": {
+				"rules": [
+					{"allow": "request.headers[\"x-pre-routing\"] == \"yes\""}
+				]
+			}
+		}))
+		.await;
+
+	let denied = send_request(io.clone(), Method::GET, "http://lo/no-route-needed").await;
+	assert_eq!(denied.status(), 403);
+	assert_eq!(read_body!(denied).as_bytes(), b"authorization failed");
+
+	let allowed = send_request_headers(
+		io,
+		Method::GET,
+		"http://lo/upstream",
+		&[("x-pre-routing", "yes")],
+	)
+	.await;
+	assert_eq!(allowed.status(), 200);
 }
 
 #[tokio::test]
@@ -1118,6 +1319,649 @@ async fn llm_openai_tokenize() {
 	.await;
 }
 
+#[tokio::test]
+async fn llm_detect_mode_passthrough_without_rewrite() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let provider = crate::types::local::LocalNamedAIProvider {
+		name: "default".into(),
+		provider: AIProvider::OpenAI(openai::Provider { model: None }),
+		host_override: Some(Target::Address(*mock.address())),
+		path_override: None,
+		path_prefix: None,
+		tokenize: false,
+		policies: serde_json::from_value(json!({
+			"ai": {
+				"routes": {
+					"/v1/chat/completions": "detect"
+				}
+			}
+		}))
+		.unwrap(),
+	};
+	let (mock, _bind, io) = setup_llm_named_provider_mock(mock, provider, "{}");
+	let body = include_bytes!("../llm/tests/requests/completions/basic.json");
+
+	let res = RequestBuilder::new(Method::POST, "http://lo/v1/chat/completions?trace=repro")
+		.header(header::CONTENT_TYPE, "application/json")
+		.body(Body::from(body.to_vec()))
+		.send(io.clone())
+		.await
+		.unwrap();
+	assert_eq!(res.status(), StatusCode::OK);
+	let _ = read_body_raw(res.into_body()).await;
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterQuery],
+		"/v1/chat/completions?trace=repro"
+	);
+	let upstream_body: Value =
+		serde_json::from_slice(&requests[0].body).expect("upstream request should be JSON");
+	let original_body: Value = serde_json::from_slice(body).expect("original request should be JSON");
+	assert_eq!(upstream_body, original_body);
+
+	let log = agent_core::telemetry::testing::eventually_find(&[
+		("scope", "request"),
+		("http.path", "/v1/chat/completions?trace=repro"),
+	])
+	.await
+	.unwrap();
+	let want = json!({
+		"gen_ai.operation.name": "chat",
+		"gen_ai.provider.name": "openai",
+		"gen_ai.request.model": "replaceme",
+		"gen_ai.response.model": "gpt-3.5-turbo-0125",
+		"gen_ai.usage.input_tokens": 17,
+		"gen_ai.usage.output_tokens": 23
+	});
+	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
+}
+
+#[tokio::test]
+async fn llm_detect_mode_respects_model_rewrite() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let provider = crate::types::local::LocalNamedAIProvider {
+		name: "default".into(),
+		provider: AIProvider::OpenAI(openai::Provider { model: None }),
+		host_override: Some(Target::Address(*mock.address())),
+		path_override: None,
+		path_prefix: None,
+		tokenize: false,
+		policies: serde_json::from_value(json!({
+			"ai": {
+				"routes": {
+					"/v1/chat/completions": "detect"
+				},
+				"overrides": {
+					"model": "replaceme-overwrite"
+				}
+			}
+		}))
+		.unwrap(),
+	};
+	let (mock, _bind, io) = setup_llm_named_provider_mock(mock, provider, "{}");
+	let body = include_bytes!("../llm/tests/requests/completions/basic.json");
+
+	let res = RequestBuilder::new(Method::POST, "http://lo/v1/chat/completions?trace=rewrite")
+		.header(header::CONTENT_TYPE, "application/json")
+		.body(Body::from(body.to_vec()))
+		.send(io.clone())
+		.await
+		.unwrap();
+	assert_eq!(res.status(), StatusCode::OK);
+	let _ = read_body_raw(res.into_body()).await;
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterQuery],
+		"/v1/chat/completions?trace=rewrite"
+	);
+	let upstream_body: Value =
+		serde_json::from_slice(&requests[0].body).expect("upstream request should be JSON");
+	assert_eq!(upstream_body["model"], "replaceme-overwrite");
+
+	let log = agent_core::telemetry::testing::eventually_find(&[
+		("scope", "request"),
+		("http.path", "/v1/chat/completions?trace=rewrite"),
+	])
+	.await
+	.unwrap();
+	let want = json!({
+		"gen_ai.operation.name": "chat",
+		"gen_ai.provider.name": "openai",
+		"gen_ai.request.model": "replaceme-overwrite",
+		"gen_ai.response.model": "gpt-3.5-turbo-0125",
+		"gen_ai.usage.input_tokens": 17,
+		"gen_ai.usage.output_tokens": 23
+	});
+	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
+}
+
+async fn setup_local_llm_config(yaml: &str) -> TestBind {
+	let t = setup_proxy_test("{}").unwrap();
+	let normalized = crate::types::local::NormalizedLocalConfig::from(
+		t.pi.cfg.as_ref(),
+		t.pi.upstream.clone(),
+		t.pi.cfg.gateway(),
+		yaml,
+	)
+	.await
+	.expect("local config normalizes");
+	t.pi.stores.binds.sync_local(
+		normalized.binds,
+		normalized.listener_routes,
+		normalized.listener_tcp_routes,
+		normalized.policies,
+		normalized.backends,
+		normalized.route_groups,
+		Default::default(),
+	);
+	t
+}
+
+async fn setup_local_llm_config_with_user_model_header(yaml: &str) -> TestBind {
+	let t = setup_proxy_test("{}").unwrap();
+	let mut normalized = crate::types::local::NormalizedLocalConfig::from(
+		t.pi.cfg.as_ref(),
+		t.pi.upstream.clone(),
+		t.pi.cfg.gateway(),
+		yaml,
+	)
+	.await
+	.expect("local config normalizes");
+	let transformation = crate::http::transformation_cel::Transformation::try_from_local_config(
+		crate::http::transformation_cel::LocalTransformationConfig {
+			request: Some(crate::http::transformation_cel::LocalTransform {
+				add: vec![(
+					strng::literal!("x-user-model"),
+					strng::literal!("metadata.agentgateway_user_model"),
+				)],
+				..Default::default()
+			}),
+			response: None,
+		},
+		true,
+	)
+	.expect("transformation config");
+	let route = normalized
+		.listener_routes
+		.iter_mut()
+		.flat_map(|(_, routes)| routes)
+		.find(|route| route.key == "llm:request")
+		.expect("LLM request route");
+	route
+		.inline_policies
+		.push(crate::types::agent::TrafficPolicy::Transformation(
+			crate::store::RequestPolicy::single(transformation),
+		));
+	t.pi.stores.binds.sync_local(
+		normalized.binds,
+		normalized.listener_routes,
+		normalized.listener_tcp_routes,
+		normalized.policies,
+		normalized.backends,
+		normalized.route_groups,
+		Default::default(),
+	);
+	t
+}
+
+#[tokio::test]
+async fn llm_local_router_handles_models_virtual_model_and_missing_model() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let config = format!(
+		r#"
+llm:
+  port: 4000
+  models:
+  - name: real-model
+    visibility: internal
+    provider: openAI
+    params:
+      baseUrl: http://{}
+  virtualModels:
+  - name: public-model
+    routing:
+      weighted:
+        targets:
+        - model: real-model
+          weight: 1
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config_with_user_model_header(&config).await;
+	let io = t.serve_http(strng::literal!("bind/4000"));
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/v1/models").await;
+	assert_eq!(res.status(), StatusCode::OK);
+	let models: Value =
+		serde_json::from_slice(&read_body_raw(res.into_body()).await).expect("models JSON");
+	assert_eq!(models["object"], "list");
+	let model_ids = models["data"]
+		.as_array()
+		.expect("model list")
+		.iter()
+		.map(|model| model["id"].as_str().expect("model id"))
+		.collect::<Vec<_>>();
+	assert_eq!(model_ids, vec!["public-model"]);
+
+	let mut request_body: Value = serde_json::from_slice(include_bytes!(
+		"../llm/tests/requests/completions/basic.json"
+	))
+	.expect("request JSON");
+	request_body["model"] = json!("public-model");
+	let request_body = serde_json::to_vec(&request_body).expect("serialized request");
+
+	let res = send_request_body(
+		io.clone(),
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		&request_body,
+	)
+	.await;
+	assert_eq!(res.status(), StatusCode::OK);
+	read_body_raw(res.into_body()).await;
+
+	let upstream_requests = mock.received_requests().await.expect("upstream requests");
+	assert_eq!(upstream_requests.len(), 1);
+	let upstream_body: Value =
+		serde_json::from_slice(&upstream_requests[0].body).expect("upstream request JSON");
+	assert_eq!(upstream_body["model"], "real-model");
+	assert_eq!(
+		upstream_requests[0]
+			.headers
+			.get("x-user-model")
+			.expect("user model header")
+			.to_str()
+			.expect("user model header value"),
+		"public-model"
+	);
+
+	let missing = json!({
+		"model": "missing-model",
+		"messages": [{"role": "user", "content": "hi"}]
+	});
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		&serde_json::to_vec(&missing).expect("serialized missing request"),
+	)
+	.await;
+	assert_eq!(res.status(), StatusCode::NOT_FOUND);
+	let missing_body: Value =
+		serde_json::from_slice(&read_body_raw(res.into_body()).await).expect("missing model JSON");
+	assert_eq!(missing_body["error"]["code"], "model_not_found");
+	assert_eq!(
+		mock
+			.received_requests()
+			.await
+			.expect("upstream requests")
+			.len(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn llm_conditional_virtual_model_no_match_returns_json_error() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let config = format!(
+		r#"
+llm:
+  port: 4000
+  models:
+  - name: real-model
+    visibility: internal
+    provider: openAI
+    params:
+      baseUrl: http://{}
+  virtualModels:
+  - name: public-model
+    routing:
+      conditional:
+        targets:
+        - model: real-model
+          when: request.headers["x-use-model"] == "true"
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	let io = t.serve_http(strng::literal!("bind/4000"));
+	let request_body = json!({
+		"model": "public-model",
+		"messages": [{"role": "user", "content": "hi"}]
+	});
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		&serde_json::to_vec(&request_body).expect("serialized request"),
+	)
+	.await;
+
+	assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+	let body: Value =
+		serde_json::from_slice(&read_body_raw(res.into_body()).await).expect("error JSON");
+	assert_eq!(body["error"]["code"], "virtual_model_no_matching_target");
+	assert_eq!(body["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		mock
+			.received_requests()
+			.await
+			.expect("upstream requests")
+			.len(),
+		0
+	);
+}
+
+#[tokio::test]
+async fn llm_model_router_handles_multipart_audio_detect_request() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let config = format!(
+		r#"
+llm:
+  port: 4000
+  models:
+  - name: real-model
+    provider: openAI
+    params:
+      baseUrl: http://{}
+    passthrough: detect
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	let io = t.serve_http(strng::literal!("bind/4000"));
+	let body = concat!(
+		"--audio-boundary\r\n",
+		"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+		"Content-Type: audio/wav\r\n",
+		"\r\n",
+		"fake-audio-bytes\r\n",
+		"--audio-boundary\r\n",
+		"Content-Disposition: form-data; name=\"model\"\r\n",
+		"\r\n",
+		"real-model\r\n",
+		"--audio-boundary--\r\n",
+	)
+	.as_bytes();
+
+	let res = RequestBuilder::new(Method::POST, "http://lo/v1/audio/transcriptions")
+		.header(
+			header::CONTENT_TYPE,
+			"multipart/form-data; boundary=audio-boundary",
+		)
+		.body(Body::from(body.to_vec()))
+		.send(io.clone())
+		.await
+		.unwrap();
+	assert_eq!(res.status(), StatusCode::OK);
+	let _ = read_body_raw(res.into_body()).await;
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterPath],
+		"/v1/audio/transcriptions"
+	);
+	assert_eq!(requests[0].body, body);
+
+	let log = agent_core::telemetry::testing::eventually_find(&[
+		("scope", "request"),
+		("http.path", "/v1/audio/transcriptions"),
+	])
+	.await
+	.unwrap();
+	let want = json!({
+		"gen_ai.provider.name": "openai",
+		"gen_ai.response.model": "gpt-3.5-turbo-0125",
+		"gen_ai.usage.input_tokens": 17,
+		"gen_ai.usage.output_tokens": 23
+	});
+	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
+}
+
+#[tokio::test]
+async fn llm_custom_rerank() {
+	let mock = body_mock(include_bytes!("../llm/tests/response/cohere/rerank.json")).await;
+	let provider = crate::types::local::LocalNamedAIProvider {
+		name: "default".into(),
+		provider: AIProvider::Custom(custom::Provider {
+			model: None,
+			provider_override: None,
+			formats: vec![custom::ProviderFormatConfig {
+				format: custom::ProviderFormat::Rerank,
+				path: None,
+			}],
+		}),
+		host_override: Some(Target::Address(*mock.address())),
+		path_override: None,
+		path_prefix: None,
+		tokenize: false,
+		policies: serde_json::from_value(json!({
+			"ai": {"routes": {"/v1/rerank": "rerank"}}
+		}))
+		.unwrap(),
+	};
+	let (mock, _bind, io) = setup_llm_named_provider_mock(mock, provider, "{}");
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/rerank",
+		include_bytes!("../llm/tests/requests/rerank/basic.json"),
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+	let body: Value =
+		serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+	assert_eq!(body["results"][0]["index"], 2);
+	assert_eq!(body["results"][0]["relevance_score"], 0.91);
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	let upstream_body: Value =
+		serde_json::from_slice(&requests[0].body).expect("upstream request should be JSON");
+	assert_eq!(
+		upstream_body["query"],
+		"What is the capital of the United States?"
+	);
+	assert_eq!(upstream_body["documents"].as_array().unwrap().len(), 3);
+}
+
+fn setup_custom_llm_provider_backend_mock(
+	mock: MockServer,
+	supported_formats: Vec<custom::ProviderFormat>,
+) -> (MockServer, TestBind, Client<MemoryConnector, Body>) {
+	setup_custom_llm_provider_backend_mock_with_formats(
+		mock,
+		supported_formats
+			.into_iter()
+			.map(|format| custom::ProviderFormatConfig { format, path: None })
+			.collect(),
+	)
+}
+
+fn setup_custom_llm_provider_backend_mock_with_formats(
+	mock: MockServer,
+	formats: Vec<custom::ProviderFormatConfig>,
+) -> (MockServer, TestBind, Client<MemoryConnector, Body>) {
+	let backend_name = "custom-ai";
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_bind(simple_bind())
+		.with_raw_backend(custom_llm_backend_with_formats(
+			backend_name,
+			SimpleBackendReference::InlineBackend(Target::Address(*mock.address())),
+			formats,
+		))
+		.with_route(basic_named_route(strng::format!("/{backend_name}")));
+	let io = t.serve_http(BIND_KEY);
+	(mock, t, io)
+}
+
+#[tokio::test]
+async fn llm_custom_provider_routes_to_provider_backend() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let (mock, _bind, io) =
+		setup_custom_llm_provider_backend_mock(mock, vec![custom::ProviderFormat::Completions]);
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		include_bytes!("../llm/tests/requests/completions/basic.json"),
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+	let _ = res.into_body().collect().await.unwrap();
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterPath],
+		"/v1/chat/completions"
+	);
+	let upstream_body: Value =
+		serde_json::from_slice(&requests[0].body).expect("upstream request should be JSON");
+	assert_eq!(upstream_body["model"], "replaceme");
+}
+
+#[tokio::test]
+async fn llm_custom_provider_uses_native_format_fallback() {
+	let mock = body_mock(include_bytes!("../llm/tests/response/anthropic/basic.json")).await;
+	let (mock, _bind, io) =
+		setup_custom_llm_provider_backend_mock(mock, vec![custom::ProviderFormat::Messages]);
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		include_bytes!("../llm/tests/requests/completions/basic.json"),
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+	let response_body: Value =
+		serde_json::from_slice(&read_body_raw(res.into_body()).await).expect("response is JSON");
+	assert_eq!(response_body["object"], "chat.completion");
+	assert_eq!(response_body["usage"]["prompt_tokens"], 15);
+	assert_eq!(response_body["usage"]["completion_tokens"], 21);
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterPath],
+		"/v1/messages"
+	);
+	let upstream_body: Value =
+		serde_json::from_slice(&requests[0].body).expect("upstream request should be JSON");
+	assert_eq!(upstream_body["system"], "You are a helpful assistant.");
+	assert_eq!(upstream_body["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
+async fn llm_custom_provider_uses_format_path_override() {
+	let mock = body_mock(include_bytes!("../llm/tests/response/anthropic/basic.json")).await;
+	let (mock, _bind, io) = setup_custom_llm_provider_backend_mock_with_formats(
+		mock,
+		vec![custom::ProviderFormatConfig {
+			format: custom::ProviderFormat::Messages,
+			path: Some(strng::literal!("/api/messages")),
+		}],
+	);
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		include_bytes!("../llm/tests/requests/completions/basic.json"),
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+	let _ = res.into_body().collect().await.unwrap();
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterPath],
+		"/api/messages"
+	);
+}
+
+#[tokio::test]
+async fn llm_custom_provider_rejects_unsupported_format_before_upstream_call() {
+	let mock = body_mock(include_bytes!(
+		"../llm/tests/response/completions/basic.json"
+	))
+	.await;
+	let (mock, _bind, io) =
+		setup_custom_llm_provider_backend_mock(mock, vec![custom::ProviderFormat::Embeddings]);
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/chat/completions",
+		include_bytes!("../llm/tests/requests/completions/basic.json"),
+	)
+	.await;
+	assert_eq!(res.status(), 503);
+	let body = res.into_body().collect().await.unwrap().to_bytes();
+	assert!(
+		String::from_utf8_lossy(&body)
+			.contains("unsupported conversion: from Completions to provider custom"),
+		"unexpected response body: {}",
+		String::from_utf8_lossy(&body)
+	);
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 0);
+}
+
 #[derive(Clone)]
 struct RecordingRateLimit {
 	requests: mpsc::UnboundedSender<crate::http::remoteratelimit::proto::RateLimitRequest>,
@@ -1289,6 +2133,102 @@ async fn llm_openai_messages_translation_with_host_override_path_behavior(
 	let upstream = &requests[0];
 	assert_eq!(
 		&upstream.url[Position::BeforePath..Position::AfterQuery],
+		expected_url
+	);
+}
+
+#[rstest::rstest]
+#[case::preserves_path(None, "/v1/models", "/v1/models")]
+#[case::path_prefix(Some("/openai/v1"), "/v1/models", "/openai/v1/models")]
+#[case::path_prefix_with_query(
+	Some("/openai/v1"),
+	"/v1/models?foo=bar",
+	"/openai/v1/models?foo=bar"
+)]
+#[case::path_prefix_non_default_path(Some("/openai/v1"), "/foo", "/openai/v1/foo")]
+#[tokio::test]
+async fn llm_openai_passthrough_applies_path_prefix(
+	#[case] path_prefix: Option<&str>,
+	#[case] request_path: &str,
+	#[case] expected_url: &str,
+) {
+	let mock = body_mock(b"{}").await;
+	let provider = crate::test_helpers::proxymock::llm_named_provider(
+		&mock,
+		AIProvider::OpenAI(openai::Provider { model: None }),
+		false,
+	);
+	let provider = crate::types::local::LocalNamedAIProvider {
+		path_prefix: path_prefix.map(strng::new),
+		..provider
+	};
+	let (mock, mut bind, io) = setup_llm_named_provider_mock(mock, provider, "{}");
+	bind
+		.attach_route_policy(json!({
+			"ai": {
+				"routes": {
+					"*": "passthrough"
+				}
+			}
+		}))
+		.await;
+
+	let res = send_request(io, Method::GET, &format!("http://lo{request_path}")).await;
+
+	assert_eq!(res.status(), 200);
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterQuery],
+		expected_url
+	);
+}
+
+// Providers without a DEFAULT_BASE_PATH (e.g. Gemini) prepend pathPrefix to the
+// full incoming path rather than replacing /v1.
+#[rstest::rstest]
+#[case::preserves_path(None, "/some/path", "/some/path")]
+#[case::path_prefix(Some("/my/prefix"), "/some/path", "/my/prefix/some/path")]
+#[tokio::test]
+async fn llm_non_openai_passthrough_prepends_path_prefix(
+	#[case] path_prefix: Option<&str>,
+	#[case] request_path: &str,
+	#[case] expected_url: &str,
+) {
+	let mock = body_mock(b"{}").await;
+	let provider = crate::test_helpers::proxymock::llm_named_provider(
+		&mock,
+		AIProvider::Gemini(gemini::Provider { model: None }),
+		false,
+	);
+	let provider = crate::types::local::LocalNamedAIProvider {
+		path_prefix: path_prefix.map(strng::new),
+		..provider
+	};
+	let (mock, mut bind, io) = setup_llm_named_provider_mock(mock, provider, "{}");
+	bind
+		.attach_route_policy(json!({
+			"ai": {
+				"routes": {
+					"/some/path": "passthrough"
+				}
+			}
+		}))
+		.await;
+
+	let res = send_request(io, Method::GET, &format!("http://lo{request_path}")).await;
+
+	assert_eq!(res.status(), 200);
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(
+		&requests[0].url[Position::BeforePath..Position::AfterQuery],
 		expected_url
 	);
 }
@@ -1639,6 +2579,7 @@ async fn tls_connection_drains_when_listener_changes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tls_backend_connection() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = http::backendtls::ResolvedBackendTLS {
@@ -1671,6 +2612,7 @@ async fn tls_backend_connection() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tls_backend_connection_alpn() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = http::backendtls::ResolvedBackendTLS {
@@ -1712,6 +2654,7 @@ async fn tls_backend_connection_alpn() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tls_backend_http2_version() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = http::backendtls::ResolvedBackendTLS {
@@ -1753,6 +2696,7 @@ async fn tls_backend_http2_version() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tls_backend_http1_version() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = http::backendtls::ResolvedBackendTLS {
@@ -1794,6 +2738,7 @@ async fn tls_backend_http1_version() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tls_backend_version_with_alpn() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = http::backendtls::ResolvedBackendTLS {
@@ -1968,6 +2913,137 @@ async fn gateway_ext_authz_response_headers_are_preserved() {
 }
 
 #[tokio::test]
+async fn gateway_http_ext_authz_caches_unauthorized_response() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	let authz = MockServer::start().await;
+	let calls = Arc::new(AtomicUsize::new(0));
+	let calls_clone = calls.clone();
+	Mock::given(wiremock::matchers::any())
+		.respond_with(move |_req: &wiremock::Request| {
+			let call = calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+			ResponseTemplate::new(StatusCode::UNAUTHORIZED.as_u16())
+				.set_body_string(format!("authz-denied-{call}"))
+		})
+		.mount(&authz)
+		.await;
+
+	bind
+		.attach_gateway_policy(json!({
+			"extAuthz": {
+				"host": authz.address().to_string(),
+				"protocol": {"http": {}},
+				"cache": {
+					"key": ["request.path"],
+					"ttl": "60s",
+				},
+			},
+		}))
+		.await;
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/p").await;
+	assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+	assert_eq!(
+		read_body_raw(res.into_body()).await.as_ref(),
+		b"authz-denied-1"
+	);
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/p").await;
+	assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+	assert_eq!(
+		read_body_raw(res.into_body()).await.as_ref(),
+		b"authz-denied-1"
+	);
+	assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gateway_http_ext_authz_does_not_cache_server_error_response() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	let authz = MockServer::start().await;
+	let calls = Arc::new(AtomicUsize::new(0));
+	let calls_clone = calls.clone();
+	Mock::given(wiremock::matchers::any())
+		.respond_with(move |_req: &wiremock::Request| {
+			let call = calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+			ResponseTemplate::new(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+				.set_body_string(format!("authz-error-{call}"))
+		})
+		.mount(&authz)
+		.await;
+
+	bind
+		.attach_gateway_policy(json!({
+			"extAuthz": {
+				"host": authz.address().to_string(),
+				"protocol": {"http": {}},
+				"cache": {
+					"key": ["request.path"],
+					"ttl": "60s",
+				},
+			},
+		}))
+		.await;
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/p").await;
+	assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(
+		read_body_raw(res.into_body()).await.as_ref(),
+		b"authz-error-1"
+	);
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/p").await;
+	assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(
+		read_body_raw(res.into_body()).await.as_ref(),
+		b"authz-error-2"
+	);
+	assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn gateway_http_ext_authz_body_expression_sets_auth_request_body() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	let authz = MockServer::start().await;
+	Mock::given(wiremock::matchers::any())
+		.respond_with(move |req: &wiremock::Request| {
+			ResponseTemplate::new(StatusCode::OK.as_u16()).insert_header(
+				"x-authz-body",
+				String::from_utf8(req.body.clone()).expect("authz request body is utf8"),
+			)
+		})
+		.mount(&authz)
+		.await;
+
+	bind
+		.attach_gateway_policy(json!({
+			"extAuthz": {
+				"host": authz.address().to_string(),
+				"protocol": {
+					"http": {
+						"body": r#"{"path": request.path, "method": request.method}"#,
+						"includeResponseHeaders": ["x-authz-body"],
+					},
+				},
+			},
+		}))
+		.await;
+
+	let res = send_request_body(io.clone(), Method::POST, "http://lo/p", b"original").await;
+	assert_eq!(res.status(), StatusCode::OK);
+	let body = read_body(res.into_body()).await;
+	let authz_body: serde_json::Value =
+		serde_json::from_slice(body.headers.get("x-authz-body").unwrap().as_bytes()).unwrap();
+	assert_eq!(
+		authz_body,
+		json!({
+			"path": "/p",
+			"method": "POST",
+		})
+	);
+	assert_eq!(body.body.as_ref(), b"original");
+}
+
+#[tokio::test]
 async fn gateway_transformation_response_headers_are_applied() {
 	let (_mock, mut bind, io) = basic_setup().await;
 	bind
@@ -2111,6 +3187,7 @@ async fn tunnel_absolute_form() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tls-aws-lc")]
 async fn tunnel_connect() {
 	let (mock, _certs) = tls_mock().await;
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2192,6 +3269,1192 @@ async fn tunnel_connect() {
 	assert!(connect_req.contains("Proxy-Authorization: Basic my-key\r\n"));
 
 	tunnel.abort();
+}
+
+#[tokio::test]
+async fn incoming_connect_dynamic_forward_proxy() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target_addr = listener.local_addr().unwrap();
+	let upstream = tokio::spawn(async move {
+		let (mut stream, _) = listener.accept().await.unwrap();
+		let mut buf = [0; 4];
+		stream.read_exact(&mut buf).await.unwrap();
+		assert_eq!(&buf, b"ping");
+		stream.write_all(b"pong").await.unwrap();
+	});
+
+	let t = setup_dfp_bind().with_connect_enabled();
+	let mut io = t.serve(BIND_KEY);
+	let req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+	io.write_all(req.as_bytes()).await.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+
+	io.write_all(b"ping").await.unwrap();
+	let mut tunneled = [0; 4];
+	io.read_exact(&mut tunneled).await.unwrap();
+	assert_eq!(&tunneled, b"pong");
+	upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn incoming_connect_requires_frontend_connect_policy() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target_addr = listener.local_addr().unwrap();
+
+	let t = setup_dfp_bind();
+	let mut io = t.serve(BIND_KEY);
+	let req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+	io.write_all(req.as_bytes()).await.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+}
+
+#[tokio::test]
+async fn incoming_connect_tunnel_reenters_bind_flow() {
+	let mock = simple_mock().await;
+	let mut outer = simple_bind();
+	outer.key = strng::literal!("outer");
+	outer.address = "127.0.0.1:15008".parse().unwrap();
+	let mut inner = simple_bind();
+	inner.address = "127.0.0.1:18080".parse().unwrap();
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(outer)
+		.with_bind(inner)
+		.with_route(basic_route(*mock.address()))
+		.with_connect_mode_on_port(frontend::ConnectMode::Tunnel, 15008);
+	let mut io = t.serve_tunnel(strng::literal!("outer"));
+	io.write_all(b"CONNECT httpbingo.org:18080 HTTP/1.1\r\nHost: httpbingo.org:18080\r\n\r\n")
+		.await
+		.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+
+	io.write_all(b"GET /foo HTTP/1.1\r\nHost: lo\r\nConnection: close\r\n\r\n")
+		.await
+		.unwrap();
+	let mut tunneled = Vec::new();
+	tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut tunneled))
+		.await
+		.expect("timed out waiting for tunneled HTTP response")
+		.unwrap();
+	assert!(
+		String::from_utf8_lossy(&tunneled).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected tunneled response: {}",
+		String::from_utf8_lossy(&tunneled),
+	);
+}
+
+/// Headers carried on a CONNECT request are captured and surfaced to CEL as
+/// `source.connectHeaders` on the re-entered (tunneled) request, so an
+/// authorization policy on the inner bind can match against them.
+#[tokio::test]
+async fn incoming_connect_tunnel_exposes_connect_headers_to_cel() {
+	async fn tunnel_inner_request(custom_header: Option<&str>) -> String {
+		let mock = simple_mock().await;
+		let mut outer = simple_bind();
+		outer.key = strng::literal!("outer");
+		outer.address = "127.0.0.1:15008".parse().unwrap();
+		let mut inner = simple_bind();
+		inner.address = "127.0.0.1:18080".parse().unwrap();
+		let mut t = setup_proxy_test("{}")
+			.unwrap()
+			.with_backend(*mock.address())
+			.with_bind(outer)
+			.with_bind(inner)
+			.with_route(basic_route(*mock.address()))
+			.with_connect_mode_on_port(frontend::ConnectMode::Tunnel, 15008);
+		// Authorization on the re-entered request only allows when the custom header
+		// carried on the CONNECT request is present and matches.
+		t.attach_route_policy(json!({
+			"authorization": {
+				"rules": ["source.connectHeaders[\"x-custom-header\"] == \"custom-value\""],
+			},
+		}))
+		.await;
+
+		let mut io = t.serve_tunnel(strng::literal!("outer"));
+		let connect = match custom_header {
+			Some(v) => format!(
+				"CONNECT httpbingo.org:18080 HTTP/1.1\r\nHost: httpbingo.org:18080\r\nx-custom-header: {v}\r\n\r\n"
+			),
+			None => {
+				"CONNECT httpbingo.org:18080 HTTP/1.1\r\nHost: httpbingo.org:18080\r\n\r\n".to_string()
+			},
+		};
+		io.write_all(connect.as_bytes()).await.unwrap();
+
+		let mut response = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+			if response.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
+
+		io.write_all(b"GET /foo HTTP/1.1\r\nHost: lo\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+		let mut tunneled = Vec::new();
+		tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut tunneled))
+			.await
+			.expect("timed out waiting for tunneled HTTP response")
+			.unwrap();
+		String::from_utf8_lossy(&tunneled).to_string()
+	}
+
+	// Header present and matching: the inner request is authorized (200).
+	let allowed = tunnel_inner_request(Some("custom-value")).await;
+	assert!(
+		allowed.starts_with("HTTP/1.1 200 OK\r\n"),
+		"expected inner request to be authorized, got: {allowed}",
+	);
+
+	// Header absent: `source.connectHeaders` is empty, the rule does not match,
+	// and the inner request is denied (403).
+	let denied = tunnel_inner_request(None).await;
+	assert!(
+		denied.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+		"expected inner request to be denied, got: {denied}",
+	);
+}
+
+/// A `tunnelProtocol: Connect` bind with an HTTPS listener terminates the OUTER
+/// TLS BEFORE serving CONNECT, so the CONNECT request and its headers are
+/// encrypted on the wire.
+///
+/// The client completes a TLS handshake to the outer bind (which only
+/// succeeds if the gateway terminated the outer TLS rather than serving plaintext
+/// CONNECT on the raw socket), sends CONNECT inside that TLS carrying a custom
+/// header, and the re-entered inner request is authorized iff the header survived
+/// (`source.connectHeaders`).
+#[tokio::test]
+async fn connect_tunnel_terminates_outer_tls() {
+	// SNI must match the `*.example.com` static cert at examples/tls/certs.
+	const SNI: &str = "gw.example.com";
+
+	async fn tls_connect_inner(custom_header: Option<&str>) -> String {
+		let mock = simple_mock().await;
+
+		// OUTER bind: HTTPS Static cert + tunnelProtocol Connect. The fix terminates
+		// this outer TLS before serving CONNECT.
+		let outer = Bind {
+			key: strng::literal!("outer"),
+			address: "127.0.0.1:15011".parse().unwrap(),
+			listeners: ListenerSet::from_list([Listener {
+				key: LISTENER_KEY,
+				name: Default::default(),
+				hostname: strng::new("*.example.com"),
+				protocol: ListenerProtocol::HTTPS(
+					types::local::LocalTLSServerConfig {
+						mode: Default::default(), // Static
+						cert: "../../examples/tls/certs/cert.pem".into(),
+						key: "../../examples/tls/certs/key.pem".into(),
+						root: None,
+						cipher_suites: None,
+						min_tls_version: None,
+						max_tls_version: None,
+						key_exchange_groups: None,
+					}
+					.try_into()
+					.unwrap(),
+				),
+			}]),
+			protocol: BindProtocol::tls,
+			tunnel_protocol: TunnelProtocol::Connect,
+		};
+
+		// INNER plain bind, re-entered by the CONNECT authority port.
+		let mut inner = simple_bind();
+		inner.address = "127.0.0.1:18083".parse().unwrap();
+
+		let mut t = setup_proxy_test("{}")
+			.unwrap()
+			.with_backend(*mock.address())
+			.with_bind(outer)
+			.with_bind(inner)
+			.with_route(basic_route(*mock.address()));
+		// Authorize the inner request only when the custom header carried on the
+		// (TLS-encrypted) CONNECT survived termination + re-entry.
+		t.attach_route_policy(json!({
+			"authorization": {
+				"rules": ["source.connectHeaders[\"x-custom-header\"] == \"custom-value\""],
+			},
+		}))
+		.await;
+
+		// Complete the OUTER TLS handshake to the Connect bind. This is the core
+		// assertion: a plaintext CONNECT bind would fail this handshake.
+		let raw = t.serve_tunnel(strng::literal!("outer"));
+		let client_tls: crate::http::backendtls::BackendTLS =
+			crate::http::backendtls::ResolvedBackendTLS {
+				root: Some(include_bytes!("../../../../examples/tls/certs/ca-cert.pem").to_vec()),
+				hostname: Some(SNI.to_string()),
+				insecure_host: true,
+				..Default::default()
+			}
+			.try_into()
+			.unwrap();
+		let mut io = TlsConnector::from(client_tls.base_config().config)
+			.connect(ServerName::try_from(SNI.to_string()).unwrap(), raw)
+			.await
+			.expect("outer TLS handshake should succeed (gateway terminates outer TLS before CONNECT)");
+
+		// CONNECT inside the outer TLS, optionally carrying the custom header.
+		let connect = match custom_header {
+			Some(v) => format!(
+				"CONNECT inner.local:18083 HTTP/1.1\r\nHost: inner.local:18083\r\nx-custom-header: {v}\r\n\r\n"
+			),
+			None => "CONNECT inner.local:18083 HTTP/1.1\r\nHost: inner.local:18083\r\n\r\n".to_string(),
+		};
+		io.write_all(connect.as_bytes()).await.unwrap();
+
+		let mut response = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+			if response.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
+
+		// Inner request over the tunnel (plaintext within the outer TLS).
+		io.write_all(b"GET /foo HTTP/1.1\r\nHost: lo\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+		let mut tunneled = Vec::new();
+		tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut tunneled))
+			.await
+			.expect("timed out waiting for tunneled HTTP response")
+			.unwrap();
+		String::from_utf8_lossy(&tunneled).to_string()
+	}
+
+	// Header present + matching: authorized (200) — proves the outer TLS was
+	// terminated, the CONNECT was read inside it, and the header reached CEL.
+	let allowed = tls_connect_inner(Some("custom-value")).await;
+	assert!(
+		allowed.starts_with("HTTP/1.1 200 OK\r\n"),
+		"expected authorized inner request, got: {allowed}",
+	);
+	// Wrong / absent header: denied (403).
+	let wrong = tls_connect_inner(Some("other-value")).await;
+	assert!(
+		wrong.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+		"expected denied inner request for wrong header, got: {wrong}",
+	);
+	let absent = tls_connect_inner(None).await;
+	assert!(
+		absent.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+		"expected denied inner request without the header, got: {absent}",
+	);
+}
+
+/// End-to-end on-behalf-of (OBO) token exchange over a CONNECT tunnel.
+///
+/// CONNECT (carrying `x-actor-token`, the actor token) -> Tunnel re-entry ->
+/// ext-authz builds an RFC 8693 token-exchange body from
+/// `source.connectHeaders["x-actor-token"]` (actor) and
+/// `request.headers["authorization"]` (subject) -> a mock STS returns an OBO JWT
+/// -> `transformations` injects `Authorization: Bearer <obo>` -> the route
+/// backend forwards it upstream.
+///
+/// Proves that `source.connectHeaders`, the ext-authz `http.body` CEL, the
+/// ext-authz cache, transformations, and the re-entered request pipeline compose
+/// into a working OBO injection. The STS is mocked, so this proves the gateway
+/// wiring rather than STS semantics.
+///
+/// Note: this uses a fixed route backend rather than `dynamic: {}`; the OBO
+/// injection (decrypted inner request) is orthogonal to how the destination is
+/// resolved, so the simpler proven CONNECT-re-entry fixture is used here.
+#[tokio::test]
+async fn connect_tunnel_obo_exchange_injects_token() {
+	use std::collections::HashMap;
+
+	// An unsigned JWT (`header.payload.signature`) carrying a near-future `exp`,
+	// so `unvalidatedJwtPayload(...).exp` resolves for the cache TTL. The gateway
+	// never validates the signature.
+	fn unsigned_jwt(payload: serde_json::Value) -> String {
+		use base64::Engine;
+		let b64 = base64::prelude::BASE64_URL_SAFE_NO_PAD;
+		let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
+		let body = b64.encode(serde_json::to_vec(&payload).unwrap());
+		format!("{header}.{body}.")
+	}
+
+	fn parse_form(body: &[u8]) -> HashMap<String, String> {
+		url::form_urlencoded::parse(body).into_owned().collect()
+	}
+
+	let exp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs()
+		+ 3600;
+	let obo_jwt = unsigned_jwt(json!({"sub": "obo-subject", "exp": exp}));
+	let obo_bearer = format!("Bearer {obo_jwt}");
+
+	// Mock STS: records each token-exchange request and returns the OBO JWT as an
+	// RFC 8693 token-exchange response.
+	let sts = MockServer::start().await;
+	let sts_bodies = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+	let sts_paths = Arc::new(StdMutex::new(Vec::<String>::new()));
+	let sts_methods = Arc::new(StdMutex::new(Vec::<String>::new()));
+	{
+		let sts_bodies = sts_bodies.clone();
+		let sts_paths = sts_paths.clone();
+		let sts_methods = sts_methods.clone();
+		let token = obo_jwt.clone();
+		Mock::given(wiremock::matchers::any())
+			.respond_with(move |req: &wiremock::Request| {
+				sts_bodies.lock().unwrap().push(req.body.clone());
+				sts_paths.lock().unwrap().push(req.url.path().to_string());
+				sts_methods.lock().unwrap().push(req.method.to_string());
+				ResponseTemplate::new(200).set_body_json(json!({
+					"access_token": token,
+					"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+					"token_type": "Bearer",
+				}))
+			})
+			.mount(&sts)
+			.await;
+	}
+
+	// Mock upstream: records the `authorization` header it receives so we can
+	// assert the OBO token was injected.
+	let upstream = MockServer::start().await;
+	let upstream_auth = Arc::new(StdMutex::new(Vec::<Option<String>>::new()));
+	{
+		let upstream_auth = upstream_auth.clone();
+		Mock::given(wiremock::matchers::any())
+			.respond_with(move |req: &wiremock::Request| {
+				let auth = req
+					.headers
+					.get("authorization")
+					.and_then(|v| v.to_str().ok())
+					.map(str::to_string);
+				upstream_auth.lock().unwrap().push(auth);
+				ResponseTemplate::new(200)
+			})
+			.mount(&upstream)
+			.await;
+	}
+
+	// Outer bind terminates the CONNECT tunnel; the inner (plain HTTP) bind is
+	// re-entered by authority port and carries the OBO policies.
+	let mut outer = simple_bind();
+	outer.key = strng::literal!("outer");
+	outer.address = "127.0.0.1:15008".parse().unwrap();
+	let mut inner = simple_bind();
+	inner.address = "127.0.0.1:18080".parse().unwrap();
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*upstream.address())
+		.with_bind(outer)
+		.with_bind(inner)
+		.with_route(basic_route(*upstream.address()))
+		.with_connect_mode_on_port(frontend::ConnectMode::Tunnel, 15008);
+
+	// ext-authz performs the RFC 8693 token exchange (actor from the CONNECT
+	// header, subject from the inner request's authorization header), caches the
+	// result keyed by subject+actor, and exposes the OBO token under `extauthz`.
+	// The transformation then injects it as the outbound `Authorization` header.
+	// Both token types are JWT: the enterprise STS `validateTokenType` accepts only
+	// `urn:ietf:params:oauth:token-type:jwt` and rejects `access_token`/`id_token`.
+	let body_expr = r#"form.encode({
+		"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": request.headers["authorization"].regexReplace("^Bearer ", ""),
+		"subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+		"actor_token": source.connectHeaders["x-actor-token"],
+		"actor_token_type": "urn:ietf:params:oauth:token-type:jwt",
+		"audience": "https://api.example.test"
+	})"#;
+	t.attach_route_policy(json!({
+		"extAuthz": {
+			"host": sts.address().to_string(),
+			"cache": {
+				"key": [
+					"request.headers[\"authorization\"]",
+					"source.connectHeaders[\"x-actor-token\"]"
+				],
+				"ttl": "extauthz.expires - 5",
+				"maxEntries": 1024
+			},
+			"protocol": {
+				"http": {
+					"path": "\"/token\"",
+					"addRequestHeaders": {
+						"content-type": "\"application/x-www-form-urlencoded\"",
+						":method": "\"POST\""
+					},
+					"body": body_expr,
+					"metadata": {
+						"token": "json(response.body).access_token",
+						"expires": "unvalidatedJwtPayload(json(response.body).access_token).exp"
+					}
+				}
+			}
+		},
+		"transformations": {
+			"request": {
+				"set": {
+					"authorization": "\"Bearer \" + extauthz.token"
+				}
+			}
+		}
+	}))
+	.await;
+
+	// Open a fresh CONNECT tunnel, optionally carrying the actor token, and send
+	// the inner request with the subject token. Returns the raw inner response.
+	async fn tunnel_request(t: &TestBind, actor: Option<&str>, subject: &str) -> String {
+		let mut io = t.serve_tunnel(strng::literal!("outer"));
+		let connect = match actor {
+			Some(a) => format!(
+				"CONNECT api.example.test:18080 HTTP/1.1\r\nHost: api.example.test:18080\r\nx-actor-token: {a}\r\n\r\n"
+			),
+			None => "CONNECT api.example.test:18080 HTTP/1.1\r\nHost: api.example.test:18080\r\n\r\n"
+				.to_string(),
+		};
+		io.write_all(connect.as_bytes()).await.unwrap();
+
+		let mut response = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+			if response.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
+
+		let inner = format!(
+			"GET /foo HTTP/1.1\r\nHost: lo\r\nauthorization: Bearer {subject}\r\nConnection: close\r\n\r\n"
+		);
+		io.write_all(inner.as_bytes()).await.unwrap();
+		let mut tunneled = Vec::new();
+		tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut tunneled))
+			.await
+			.expect("timed out waiting for tunneled HTTP response")
+			.unwrap();
+		String::from_utf8_lossy(&tunneled).to_string()
+	}
+
+	// 1. First request: the OBO token is exchanged and injected upstream.
+	let resp1 = tunnel_request(&t, Some("actor-token-A"), "subject-token-S").await;
+	assert!(
+		resp1.starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected inner response: {resp1}",
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		1,
+		"STS should be called once"
+	);
+	// Upstream sees the OBO bearer, not the original subject token.
+	assert_eq!(
+		upstream_auth.lock().unwrap().last().unwrap().as_deref(),
+		Some(obo_bearer.as_str()),
+	);
+	// The STS request body is a well-formed RFC 8693 exchange built from both the
+	// actor (CONNECT header) and subject (inner authorization header) tokens.
+	let form = parse_form(&sts_bodies.lock().unwrap()[0]);
+	assert_eq!(
+		form.get("grant_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:grant-type:token-exchange"),
+	);
+	assert_eq!(
+		form.get("subject_token").map(String::as_str),
+		Some("subject-token-S"),
+	);
+	assert_eq!(
+		form.get("actor_token").map(String::as_str),
+		Some("actor-token-A"),
+	);
+	assert_eq!(
+		form.get("audience").map(String::as_str),
+		Some("https://api.example.test"),
+	);
+	assert_eq!(
+		form.get("subject_token_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:token-type:jwt"),
+	);
+	assert_eq!(
+		form.get("actor_token_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:token-type:jwt"),
+	);
+	assert_eq!(sts_paths.lock().unwrap()[0], "/token");
+	assert_eq!(sts_methods.lock().unwrap()[0], "POST");
+
+	// 2. Cache hit: same subject+actor on a fresh tunnel reuses the cached OBO
+	// token without calling the STS again.
+	let resp2 = tunnel_request(&t, Some("actor-token-A"), "subject-token-S").await;
+	assert!(
+		resp2.starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected inner response: {resp2}",
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		1,
+		"cache hit: STS should not be called again",
+	);
+	assert_eq!(
+		upstream_auth.lock().unwrap().last().unwrap().as_deref(),
+		Some(obo_bearer.as_str()),
+	);
+
+	// 3. Cache miss: a different actor token (the cache key includes the actor)
+	// triggers a new exchange.
+	let resp3 = tunnel_request(&t, Some("actor-token-B"), "subject-token-S").await;
+	assert!(
+		resp3.starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected inner response: {resp3}",
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		2,
+		"different actor should miss the cache",
+	);
+	let form_b = parse_form(&sts_bodies.lock().unwrap()[1]);
+	assert_eq!(
+		form_b.get("actor_token").map(String::as_str),
+		Some("actor-token-B"),
+	);
+
+	// 4. Negative: without the actor token, the body expression fails to evaluate
+	// (indexing the missing CONNECT header errors), so the request is rejected and
+	// the STS is never called. This documents the dependency on the actor token.
+	let resp4 = tunnel_request(&t, None, "subject-token-S").await;
+	assert!(
+		resp4.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+		"expected 403 without the actor token, got: {resp4}",
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		2,
+		"rejected request must not call the STS",
+	);
+}
+
+/// Full assembled MITM + OBO chain in one test:
+///
+/// CONNECT (carrying `x-actor-token`) -> Tunnel re-entry by authority port into a
+/// dynamic-CA HTTPS bind -> inner TLS terminated with a minted per-SNI cert ->
+/// ext-authz RFC 8693 exchange (actor from `source.connectHeaders`, subject from
+/// the decrypted `authorization`, both JWT token types) -> mock STS returns the
+/// OBO -> `transformations` injects `Authorization: Bearer <obo>` -> a
+/// `dynamic: {}` (DFP) backend forwards to the upstream named by the inner Host.
+///
+/// This exercises the joints the OBO test and a plain authz test only prove
+/// separately: (1) re-entry by port into a TLS-terminating bind, (2) dynamic-CA
+/// minting a trusted per-SNI cert, (3) `ConnectHeaders` surviving
+/// `maybe_terminate_tls` into the OBO body, and (4) the decrypted request flowing
+/// into the `dynamic: {}` backend path.
+#[cfg(feature = "tls-aws-lc")]
+#[tokio::test]
+async fn connect_tunnel_dynamic_ca_obo_dynamic_backend() {
+	use std::collections::HashMap;
+
+	// SNI drives dynamic-CA cert minting; it must be a hostname (rustls sends no SNI
+	// for an IP). The DFP destination is taken from the inner request's `Host` and
+	// uses the upstream mock's address, so the two legitimately differ in the test.
+	const SNI: &str = "api.example.test";
+
+	fn unsigned_jwt(payload: serde_json::Value) -> String {
+		use base64::Engine;
+		let b64 = base64::prelude::BASE64_URL_SAFE_NO_PAD;
+		let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
+		let body = b64.encode(serde_json::to_vec(&payload).unwrap());
+		format!("{header}.{body}.")
+	}
+	fn parse_form(body: &[u8]) -> HashMap<String, String> {
+		url::form_urlencoded::parse(body).into_owned().collect()
+	}
+
+	let _ = rustls::crypto::CryptoProvider::install_default(Arc::unwrap_or_clone(
+		crate::transport::tls::provider(),
+	));
+
+	let exp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs()
+		+ 3600;
+	let obo_jwt = unsigned_jwt(json!({"sub": "obo-subject", "exp": exp}));
+	let obo_bearer = format!("Bearer {obo_jwt}");
+
+	// Mock STS: records the token-exchange request body and returns the OBO JWT.
+	let sts = MockServer::start().await;
+	let sts_bodies = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+	{
+		let sts_bodies = sts_bodies.clone();
+		let token = obo_jwt.clone();
+		Mock::given(wiremock::matchers::any())
+			.respond_with(move |req: &wiremock::Request| {
+				sts_bodies.lock().unwrap().push(req.body.clone());
+				ResponseTemplate::new(200).set_body_json(json!({
+					"access_token": token,
+					"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+					"token_type": "Bearer",
+				}))
+			})
+			.mount(&sts)
+			.await;
+	}
+
+	// Mock upstream: the `dynamic: {}` destination. Records the `authorization`
+	// header it receives so we can confirm the OBO was injected.
+	let upstream = MockServer::start().await;
+	let upstream_addr = upstream.address().to_string();
+	let upstream_auth = Arc::new(StdMutex::new(Vec::<Option<String>>::new()));
+	{
+		let upstream_auth = upstream_auth.clone();
+		Mock::given(wiremock::matchers::any())
+			.respond_with(move |req: &wiremock::Request| {
+				let auth = req
+					.headers
+					.get("authorization")
+					.and_then(|v| v.to_str().ok())
+					.map(str::to_string);
+				upstream_auth.lock().unwrap().push(auth);
+				ResponseTemplate::new(200)
+			})
+			.mount(&upstream)
+			.await;
+	}
+
+	// Generate a self-signed CA; the dynamic-CA inner bind mints a leaf per SNI, and
+	// the inner TLS client trusts it as its root.
+	let ca_key = rcgen::KeyPair::generate().expect("generate CA key");
+	let mut ca_params = rcgen::CertificateParams::default();
+	ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+	let ca_cert = ca_params.self_signed(&ca_key).expect("generate CA cert");
+	let ca_cert_pem = ca_cert.pem().into_bytes();
+
+	let tls_config = crate::types::agent::ServerTLSConfig::dynamic_ca_with_profile(
+		ca_cert_pem.clone(),
+		ca_key.serialize_pem().into_bytes(),
+		vec![b"http/1.1".to_vec()],
+		None,
+		None,
+		None,
+		None,
+		Default::default(),
+	)
+	.expect("build dynamic CA TLS config");
+
+	// Outer bind terminates the CONNECT tunnel via the bind-level `tunnelProtocol: Connect`
+	let mut outer = simple_bind();
+	outer.key = strng::literal!("outer");
+	outer.address = "127.0.0.1:15010".parse().unwrap();
+	outer.tunnel_protocol = TunnelProtocol::Connect;
+	// Inner bind terminates TLS with the dynamic CA (empty hostname = match any SNI).
+	let inner = Bind {
+		key: BIND_KEY,
+		address: "127.0.0.1:18082".parse().unwrap(),
+		listeners: ListenerSet::from_list([Listener {
+			key: LISTENER_KEY,
+			name: Default::default(),
+			hostname: Default::default(),
+			protocol: ListenerProtocol::HTTPS(tls_config),
+		}]),
+		protocol: BindProtocol::tls,
+		tunnel_protocol: Default::default(),
+	};
+
+	// `dynamic: {}` backend: the upstream is resolved from the decrypted request's
+	// Host/authority (DFP), proven on direct requests by `dfp_uses_host_port`.
+	let dynamic_backend = Backend::Dynamic(ResourceName::new("dynamic".into(), "".into()), ());
+	let t = setup_proxy_test("{}").unwrap();
+	t.inputs()
+		.stores
+		.binds
+		.write()
+		.insert_backend(dynamic_backend.name(), dynamic_backend.into());
+	let mut t = t
+		.with_bind(outer)
+		.with_bind(inner)
+		.with_route(basic_named_route("/dynamic".into()));
+
+	// Both token types are JWT (the enterprise STS rejects `access_token`); the
+	// actor is the surviving CONNECT header, the subject the decrypted authorization.
+	let body_expr = r#"form.encode({
+		"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": request.headers["authorization"].regexReplace("^Bearer ", ""),
+		"subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+		"actor_token": source.connectHeaders["x-actor-token"],
+		"actor_token_type": "urn:ietf:params:oauth:token-type:jwt",
+		"audience": request.host
+	})"#;
+	t.attach_route_policy(json!({
+		"extAuthz": {
+			"host": sts.address().to_string(),
+			"protocol": {
+				"http": {
+					"path": "\"/token\"",
+					"addRequestHeaders": {
+						"content-type": "\"application/x-www-form-urlencoded\"",
+						":method": "\"POST\""
+					},
+					"body": body_expr,
+					"metadata": {
+						"token": "json(response.body).access_token"
+					}
+				}
+			}
+		},
+		"transformations": {
+			"request": {
+				"set": {
+					"authorization": "\"Bearer \" + extauthz.token"
+				}
+			}
+		}
+	}))
+	.await;
+
+	// Open a CONNECT tunnel (optionally carrying the actor token), run an inner TLS
+	// handshake over the tunnel trusting the generated CA, then send an HTTPS request
+	// whose Host names the DFP upstream. The handshake is expected to succeed in all
+	// cases; the status reflects whether the OBO exchange (and thus the actor header)
+	// completed.
+	async fn tls_tunnel_request(
+		t: &TestBind,
+		ca_pem: &[u8],
+		upstream_host: &str,
+		actor: Option<&str>,
+	) -> StatusCode {
+		let mut io = t.serve_tunnel(strng::literal!("outer"));
+		let connect = match actor {
+			Some(a) => {
+				format!("CONNECT {SNI}:18082 HTTP/1.1\r\nHost: {SNI}:18082\r\nx-actor-token: {a}\r\n\r\n")
+			},
+			None => format!("CONNECT {SNI}:18082 HTTP/1.1\r\nHost: {SNI}:18082\r\n\r\n"),
+		};
+		io.write_all(connect.as_bytes()).await.unwrap();
+
+		let mut response = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+			if response.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
+
+		// Inner TLS handshake as a client trusting the generated CA. Success proves
+		// re-entry-by-port reached the dynamic-CA bind and it minted a trusted cert
+		// for the SNI.
+		let client_tls: crate::http::backendtls::BackendTLS =
+			crate::http::backendtls::ResolvedBackendTLS {
+				root: Some(ca_pem.to_vec()),
+				hostname: Some(SNI.to_string()),
+				alpn: Some(vec!["http/1.1".to_string()]),
+				..Default::default()
+			}
+			.try_into()
+			.unwrap();
+		let tls = TlsConnector::from(client_tls.base_config().config)
+			.connect(ServerName::try_from(SNI.to_string()).unwrap(), io)
+			.await
+			.expect("inner TLS handshake should succeed (dynamic CA mints a trusted cert)");
+
+		let (mut sender, conn) = http1::handshake(TokioIo::new(tls)).await.unwrap();
+		let conn = tokio::spawn(conn);
+		let res = sender
+			.send_request(
+				::http::Request::builder()
+					.method(Method::GET)
+					.uri("/foo")
+					.header(header::HOST, upstream_host)
+					.header(header::AUTHORIZATION, "Bearer subject-token-S")
+					.header(header::CONNECTION, "close")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		let status = res.status();
+		conn.abort();
+		status
+	}
+
+	// Actor token present: the handshake succeeds, the OBO is exchanged (JWT types)
+	// and injected, and the DFP upstream receives `Bearer <obo>` (200).
+	assert_eq!(
+		tls_tunnel_request(&t, &ca_cert_pem, &upstream_addr, Some("actor-token-A")).await,
+		StatusCode::OK,
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		1,
+		"STS should be called once"
+	);
+	assert_eq!(
+		upstream_auth.lock().unwrap().last().unwrap().as_deref(),
+		Some(obo_bearer.as_str()),
+		"DFP upstream must receive the injected OBO token",
+	);
+	// The exchange body is well-formed: actor from the surviving CONNECT header,
+	// subject from the decrypted request, JWT token types, audience = inner Host.
+	let form = parse_form(&sts_bodies.lock().unwrap()[0]);
+	assert_eq!(
+		form.get("grant_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:grant-type:token-exchange"),
+	);
+	assert_eq!(
+		form.get("subject_token").map(String::as_str),
+		Some("subject-token-S"),
+	);
+	assert_eq!(
+		form.get("actor_token").map(String::as_str),
+		Some("actor-token-A"),
+	);
+	assert_eq!(
+		form.get("subject_token_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:token-type:jwt"),
+	);
+	assert_eq!(
+		form.get("actor_token_type").map(String::as_str),
+		Some("urn:ietf:params:oauth:token-type:jwt"),
+	);
+	assert_eq!(
+		form.get("audience").map(String::as_str),
+		Some(upstream_addr.as_str())
+	);
+
+	// Actor token absent: the handshake still succeeds (TLS termination is
+	// independent of the actor), but the OBO body fails to evaluate, so the request
+	// is rejected (403) and neither the STS nor the upstream sees a second call.
+	assert_eq!(
+		tls_tunnel_request(&t, &ca_cert_pem, &upstream_addr, None).await,
+		StatusCode::FORBIDDEN,
+	);
+	assert_eq!(
+		sts_bodies.lock().unwrap().len(),
+		1,
+		"rejected request must not call the STS",
+	);
+	assert_eq!(
+		upstream_auth.lock().unwrap().len(),
+		1,
+		"rejected request must not reach the upstream",
+	);
+}
+
+#[tokio::test]
+async fn incoming_connect_applies_backend_tls() {
+	let (mock, certs) = tls_mock().await;
+	let backend_tls = http::backendtls::ResolvedBackendTLS {
+		root: Some(certs.root_cert.pem().into_bytes()),
+		hostname: Some("localhost".to_string()),
+		alpn: Some(vec!["http/1.1".to_string()]),
+		..Default::default()
+	}
+	.try_into()
+	.unwrap();
+
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_connect_enabled()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", mock.address()), "".into()),
+				Target::Address(*mock.address()),
+			),
+			inline_policies: vec![BackendTrafficPolicy::BackendTLS(backend_tls)],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+
+	let mut io = t.serve(BIND_KEY);
+	let authority = mock.address().to_string();
+	io.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+		.await
+		.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+
+	io.write_all(
+		format!("GET /foo HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n").as_bytes(),
+	)
+	.await
+	.unwrap();
+	let mut tunneled = Vec::new();
+	tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut tunneled))
+		.await
+		.expect("timed out waiting for tunneled TLS backend response")
+		.unwrap();
+	assert!(
+		String::from_utf8_lossy(&tunneled).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected tunneled response: {}",
+		String::from_utf8_lossy(&tunneled),
+	);
+}
+
+#[tokio::test]
+async fn incoming_connect_requires_authority_port() {
+	let t = setup_dfp_bind().with_connect_enabled();
+	let mut io = t.serve(BIND_KEY);
+	io.write_all(b"CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n")
+		.await
+		.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+}
+
+#[tokio::test]
+async fn incoming_connect_uses_backend_tunnel_proxy() {
+	let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target_addr = target_listener.local_addr().unwrap();
+	let target = tokio::spawn(async move {
+		let (mut stream, _) = target_listener.accept().await.unwrap();
+		let mut buf = [0; 4];
+		stream.read_exact(&mut buf).await.unwrap();
+		assert_eq!(&buf, b"ping");
+		stream.write_all(b"pong").await.unwrap();
+	});
+
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let proxy_addr = listener.local_addr().unwrap();
+	let (connect_tx, connect_rx) = oneshot::channel();
+	let proxy = tokio::spawn(async move {
+		let (mut downstream, _) = listener.accept().await.unwrap();
+		let mut buf = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = downstream.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT request unexpectedly closed");
+			buf.extend_from_slice(&chunk[..n]);
+			if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+		connect_tx
+			.send(String::from_utf8(buf[..header_end].to_vec()).unwrap())
+			.unwrap();
+		downstream
+			.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+			.await
+			.unwrap();
+		let mut upstream = TcpStream::connect(target_addr).await.unwrap();
+		let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+	});
+
+	let mut t = setup_dfp_bind().with_connect_enabled();
+	t.with_policy(TargetedPolicy {
+		key: strng::literal!("pol/backend-tunnel"),
+		name: None,
+		inheritance: PolicyInheritance::default(),
+		target: PolicyTarget::Backend(BackendTarget::Backend {
+			name: strng::literal!("dynamic"),
+			namespace: Default::default(),
+			section: None,
+		}),
+		policy: BackendTrafficPolicy::Tunnel(backend::Tunnel {
+			proxy: Arc::new(SimpleBackendReference::InlineBackend(Target::Address(
+				proxy_addr,
+			))),
+		})
+		.into(),
+	});
+	let mut io = t.serve(BIND_KEY);
+	let req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+	io.write_all(req.as_bytes()).await.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+
+	let connect_req = connect_rx.await.unwrap();
+	assert!(connect_req.starts_with(&format!("CONNECT {target_addr} HTTP/1.1\r\n")));
+	assert!(connect_req.contains(&format!("Host: {target_addr}\r\n")));
+
+	io.write_all(b"ping").await.unwrap();
+	let mut tunneled = [0; 4];
+	io.read_exact(&mut tunneled).await.unwrap();
+	assert_eq!(&tunneled, b"pong");
+	drop(io);
+	target.await.unwrap();
+	proxy.await.unwrap();
+}
+
+#[tokio::test]
+async fn incoming_connect_snapshots_request_for_cel_logging() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target_addr = listener.local_addr().unwrap();
+	let upstream = tokio::spawn(async move {
+		let (mut stream, _) = listener.accept().await.unwrap();
+		let _ = stream.read(&mut [0; 1]).await;
+	});
+
+	let config = serde_json::to_string(&json!({
+		"config": {
+			"logging": {
+				"fields": {
+					"add": {
+						"request": "request",
+						"backend": "backend",
+					},
+				},
+			},
+		},
+	}))
+	.unwrap();
+	let t = setup_dfp_bind_with_config(&config).with_connect_enabled();
+	let mut io = t.serve(BIND_KEY);
+	let req = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+	io.write_all(req.as_bytes()).await.unwrap();
+
+	let mut response = Vec::new();
+	loop {
+		let mut chunk = [0; 1024];
+		let n = io.read(&mut chunk).await.unwrap();
+		assert!(n > 0, "CONNECT response unexpectedly closed");
+		response.extend_from_slice(&chunk[..n]);
+		if response.windows(4).any(|w| w == b"\r\n\r\n") {
+			break;
+		}
+	}
+	assert!(
+		String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+		"unexpected CONNECT response: {}",
+		String::from_utf8_lossy(&response),
+	);
+	drop(io);
+	upstream.await.unwrap();
+
+	let log = agent_core::telemetry::testing::eventually_find(&[
+		("scope", "request"),
+		("endpoint", &target_addr.to_string()),
+	])
+	.await
+	.unwrap();
+	assert_eq!(log["http.path"].as_str(), Some("/"));
+	assert_eq!(log["request"]["method"].as_str(), Some("CONNECT"));
+	assert_eq!(log["request"]["path"].as_str(), Some("/"));
+	assert_eq!(
+		log["request"]["host"].as_str(),
+		Some(target_addr.to_string().as_str())
+	);
+	assert_eq!(log["request"]["scheme"].as_str(), Some("http"));
+	assert!(
+		log["backend"].is_object(),
+		"backend CEL context should be populated"
+	);
 }
 
 #[tokio::test]
@@ -2451,20 +4714,58 @@ async fn assert_llm(io: Client<MemoryConnector, Body>, body: &[u8], want: Value)
 
 // --- Dynamic Forward Proxy (DFP) tests ---
 
+impl TestBind {
+	fn with_connect_enabled(self) -> Self {
+		self.with_connect_mode(frontend::ConnectMode::Route)
+	}
+
+	fn with_connect_mode(self, mode: frontend::ConnectMode) -> Self {
+		self.with_connect_policy(mode, None)
+	}
+
+	fn with_connect_mode_on_port(self, mode: frontend::ConnectMode, port: u16) -> Self {
+		self.with_connect_policy(mode, Some(port))
+	}
+
+	fn with_connect_policy(mut self, mode: frontend::ConnectMode, port: Option<u16>) -> Self {
+		self.with_policy(TargetedPolicy {
+			key: strng::literal!("pol/frontend-connect"),
+			name: None,
+			inheritance: PolicyInheritance::default(),
+			target: PolicyTarget::Gateway(ListenerTarget {
+				gateway_name: strng::literal!("default"),
+				gateway_namespace: strng::literal!("default"),
+				listener_name: None,
+				port,
+			}),
+			policy: FrontendPolicy::Connect(frontend::Connect { mode }).into(),
+		});
+		self
+	}
+}
+
 /// Helper to set up a DFP test: creates a Dynamic backend and a route pointing to it.
-fn setup_dfp() -> (TestBind, Client<MemoryConnector, Body>) {
+fn setup_dfp_bind() -> TestBind {
+	setup_dfp_bind_with_config("{}")
+}
+
+fn setup_dfp_bind_with_config(config: &str) -> TestBind {
 	let backend_name = ResourceName::new("dynamic".into(), "".into());
 	let dynamic_backend = Backend::Dynamic(backend_name, ());
 
 	let route = basic_named_route("/dynamic".into());
 
-	let t = setup_proxy_test("{}").unwrap();
+	let t = setup_proxy_test(config).unwrap();
 	let pi = t.inputs();
 	pi.stores
 		.binds
 		.write()
 		.insert_backend(dynamic_backend.name(), dynamic_backend.into());
-	let t = t.with_bind(simple_bind()).with_route(route);
+	t.with_bind(simple_bind()).with_route(route)
+}
+
+fn setup_dfp() -> (TestBind, Client<MemoryConnector, Body>) {
+	let t = setup_dfp_bind();
 	let io = t.serve_http(BIND_KEY);
 	(t, io)
 }
@@ -2486,6 +4787,7 @@ fn setup_dfp_https() -> (TestBind, Client<MemoryConnector, Body>) {
 			hostname: Default::default(),
 			protocol: ListenerProtocol::HTTPS(
 				types::local::LocalTLSServerConfig {
+					mode: Default::default(),
 					cert: "../../examples/tls/certs/cert.pem".into(),
 					key: "../../examples/tls/certs/key.pem".into(),
 					root: None,
@@ -2511,6 +4813,44 @@ fn setup_dfp_https() -> (TestBind, Client<MemoryConnector, Body>) {
 	let t = t.with_bind(bind).with_route(route);
 	let io = t.serve_https(BIND_KEY, None);
 	(t, io)
+}
+
+/// DFP and inference routing are orthogonal: DFP chooses the upstream from the request authority,
+/// while inference routing expects an endpoint picker to choose the upstream endpoint.
+#[tokio::test]
+async fn dfp_rejects_inference_routing() {
+	let backend_name = ResourceName::new("dynamic".into(), "".into());
+	let dynamic_backend = BackendWithPolicies {
+		backend: Backend::Dynamic(backend_name, ()),
+		inline_policies: vec![BackendTrafficPolicy::InferenceRouting(
+			ext_proc::InferenceRouting {
+				target: Arc::new(SimpleBackendReference::InlineBackend(Target::from((
+					"127.0.0.1",
+					9002,
+				)))),
+				destination_mode: ext_proc::InferenceRoutingDestinationMode::Passthrough,
+				failure_mode: ext_proc::FailureMode::FailClosed,
+			},
+		)],
+	};
+
+	let route = basic_named_route("/dynamic".into());
+	let t = setup_proxy_test("{}").unwrap();
+	let pi = t.inputs();
+	pi.stores
+		.binds
+		.write()
+		.insert_backend(dynamic_backend.backend.name(), dynamic_backend);
+	let t = t.with_bind(simple_bind()).with_route(route);
+	let io = t.serve_http(BIND_KEY);
+
+	let res = send_request(io, Method::GET, "http://example.com/dynamic").await;
+	assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let body = res.into_body().collect().await.unwrap().to_bytes();
+	assert_eq!(
+		String::from_utf8_lossy(&body),
+		"processing failed: inferenceRouting is not supported with dynamic backends"
+	);
 }
 
 /// DFP resolves the destination from the request's Host/URI authority, including the port.
@@ -2780,6 +5120,7 @@ async fn auto_protocol_mixed_listeners() {
 				hostname: strng::new("*.example.com"),
 				protocol: ListenerProtocol::HTTPS(
 					types::local::LocalTLSServerConfig {
+						mode: Default::default(),
 						cert: "../../examples/tls/certs/cert.pem".into(),
 						key: "../../examples/tls/certs/key.pem".into(),
 						root: None,
@@ -2881,6 +5222,75 @@ async fn waypoint_http_basic() {
 	assert_eq!(res.status(), 200);
 	let body = read_body(res.into_body()).await;
 	assert_eq!(body.method, Method::GET);
+}
+
+#[tokio::test]
+async fn waypoint_http_port_selects_distinct_backend() {
+	// Two service routes on the same (service, path "/") differ only by their referenced
+	// service_port. A request to :443 must reach the :443 backend, :80 the :80 backend.
+	async fn id_mock(id: &'static str) -> MockServer {
+		let mock = MockServer::start().await;
+		Mock::given(wiremock::matchers::path_regex("/.*"))
+			.respond_with(ResponseTemplate::new(200).insert_header("x-backend", id))
+			.mount(&mock)
+			.await;
+		mock
+	}
+	let b80 = id_mock("p80").await;
+	let b443 = id_mock("p443").await;
+
+	let svc_nh = crate::types::discovery::NamespacedHostname {
+		namespace: strng::literal!("default"),
+		hostname: strng::literal!("my-svc.default.svc.cluster.local"),
+	};
+	let route = |key: &'static str, port: u16| Route {
+		key: strng::new(key),
+		service_key: Some(svc_nh.clone()),
+		service_port: port,
+		name: crate::types::agent::RouteName {
+			name: strng::new(key),
+			namespace: strng::literal!("default"),
+			rule_name: None,
+			kind: None,
+		},
+		hostnames: vec![],
+		matches: vec![RouteMatch {
+			headers: vec![],
+			path: PathMatch::PathPrefix("/".into()),
+			method: None,
+			query: vec![],
+		}],
+		llm_router: None,
+		inline_policies: vec![],
+		backends: vec![crate::types::agent::RouteBackendReference {
+			weight: 1,
+			target: crate::types::agent::BackendReference::Service {
+				name: svc_nh.clone(),
+				port,
+			}
+			.into(),
+			inline_policies: vec![],
+		}],
+	};
+
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_bind(waypoint_bind(ListenerProtocol::HBONE))
+		.with_waypoint_service_with_ports(&[(80, *b80.address()), (443, *b443.address())])
+		.with_service_route(route("r80", 80))
+		.with_service_route(route("r443", 443));
+
+	// Destination :443 -> the 443-scoped route -> the :443 backend.
+	let io = t.serve_waypoint_http_port(BIND_KEY, 443);
+	let res = send_request(io, Method::GET, "http://my-svc.default.svc.cluster.local").await;
+	assert_eq!(res.status(), 200);
+	assert_eq!(res.hdr("x-backend"), "p443");
+
+	// Destination :80 -> the 80-scoped route -> the :80 backend.
+	let io = t.serve_waypoint_http_port(BIND_KEY, 80);
+	let res = send_request(io, Method::GET, "http://my-svc.default.svc.cluster.local").await;
+	assert_eq!(res.status(), 200);
+	assert_eq!(res.hdr("x-backend"), "p80");
 }
 
 #[tokio::test]
@@ -3133,6 +5543,181 @@ async fn ingress_use_waypoint_false_no_waypoint() {
 
 	// Target should be a direct workload address, not hostname
 	assert_matches!(backend_call.target, Target::Address(_));
+}
+
+#[tokio::test]
+async fn ingress_use_waypoint_remote_waypoint_uses_network_gateway() {
+	use crate::proxy::httpproxy;
+	use crate::store::LocalWorkload;
+	use crate::types::discovery::gatewayaddress::Destination;
+	use crate::types::discovery::{
+		GatewayAddress, Identity, InboundProtocol, NamespacedHostname, NetworkAddress, Service,
+		Workload,
+	};
+
+	let mock = simple_mock().await;
+	let waypoint_vip: std::net::IpAddr = "240.240.0.5".parse().unwrap();
+	let waypoint_ip: std::net::IpAddr = "10.20.0.12".parse().unwrap();
+	let gateway_ip: std::net::IpAddr = "172.18.7.110".parse().unwrap();
+	let remote_network = strng::literal!("network-2");
+	let t = setup_proxy_test("{}").unwrap();
+
+	let svc = Service {
+		name: strng::literal!("my-svc"),
+		namespace: strng::literal!("default"),
+		hostname: strng::literal!("my-svc.default.svc.cluster.local"),
+		vips: vec![NetworkAddress {
+			network: strng::EMPTY,
+			address: "10.0.0.1".parse().unwrap(),
+		}],
+		ports: std::collections::HashMap::from([(80, mock.address().port())]),
+		waypoint: Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::literal!("default"),
+				hostname: strng::literal!("waypoint.default.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+		ingress_use_waypoint: true,
+		..Default::default()
+	};
+	let wl = LocalWorkload {
+		workload: Workload {
+			uid: strng::literal!("test-wl-uid"),
+			name: strng::literal!("test-wl"),
+			namespace: strng::literal!("default"),
+			workload_ips: vec![mock.address().ip()],
+			..Default::default()
+		},
+		services: std::collections::HashMap::from([(
+			"default/my-svc.default.svc.cluster.local".to_string(),
+			std::collections::HashMap::from([(80, mock.address().port())]),
+		)]),
+	};
+	let wp_svc = Service {
+		name: strng::literal!("waypoint"),
+		namespace: strng::literal!("default"),
+		hostname: strng::literal!("waypoint.default.svc.cluster.local"),
+		vips: vec![NetworkAddress {
+			network: strng::EMPTY,
+			address: waypoint_vip,
+		}],
+		ports: std::collections::HashMap::from([(15008, 15008)]),
+		subject_alt_names: vec![Identity::Spiffe {
+			trust_domain: strng::literal!("td2"),
+			namespace: strng::literal!("default"),
+			service_account: strng::literal!("waypoint-san"),
+		}],
+		..Default::default()
+	};
+	let wp_wl = LocalWorkload {
+		workload: Workload {
+			uid: strng::literal!("test-waypoint-wl-uid"),
+			name: strng::literal!("test-waypoint-wl"),
+			namespace: strng::literal!("default"),
+			service_account: strng::literal!("waypoint"),
+			network: remote_network.clone(),
+			workload_ips: vec![waypoint_ip],
+			network_gateway: Some(GatewayAddress {
+				destination: Destination::Address(NetworkAddress {
+					network: remote_network.clone(),
+					address: gateway_ip,
+				}),
+				hbone_mtls_port: 15008,
+			}),
+			..Default::default()
+		},
+		services: std::collections::HashMap::from([(
+			"default/waypoint.default.svc.cluster.local".to_string(),
+			std::collections::HashMap::from([(15008, 15008)]),
+		)]),
+	};
+	let gw_wl = LocalWorkload {
+		workload: Workload {
+			uid: strng::literal!("test-gateway-wl-uid"),
+			name: strng::literal!("test-gateway-wl"),
+			namespace: strng::literal!("istio-gateways"),
+			service_account: strng::literal!("istio-eastwest"),
+			network: remote_network.clone(),
+			workload_ips: vec![gateway_ip],
+			..Default::default()
+		},
+		services: Default::default(),
+	};
+
+	t.pi
+		.stores
+		.discovery
+		.sync_local(
+			vec![svc, wp_svc],
+			vec![wl, wp_wl, gw_wl],
+			Default::default(),
+		)
+		.unwrap();
+
+	let svc = t
+		.pi
+		.stores
+		.read_discovery()
+		.services
+		.get_by_namespaced_host(&NamespacedHostname {
+			namespace: strng::literal!("default"),
+			hostname: strng::literal!("my-svc.default.svc.cluster.local"),
+		})
+		.expect("service must exist");
+
+	let backend_call = httpproxy::build_service_call(
+		&t.pi,
+		Default::default(),
+		&mut None,
+		Default::default(),
+		&svc,
+		&80,
+		None,
+		None,
+	)
+	.expect("build_service_call should succeed");
+
+	assert!(
+		backend_call.waypoint.is_none(),
+		"remote waypoint should be reached through double HBONE, not direct waypoint transport"
+	);
+	let (resolved_gw, gw_identities) = backend_call
+		.network_gateway
+		.expect("remote waypoint should resolve a network gateway");
+	assert_matches!(resolved_gw.destination, Destination::Address(addr) => {
+		assert_eq!(addr.address, gateway_ip);
+		assert_eq!(addr.network, remote_network);
+	});
+	assert_eq!(resolved_gw.hbone_mtls_port, 15008);
+	// Outer tunnel: gateway workload id (the gateway is referenced by address, so no SANs).
+	assert_eq!(
+		gw_identities,
+		vec![Identity::Spiffe {
+			trust_domain: strng::EMPTY,
+			namespace: strng::literal!("istio-gateways"),
+			service_account: strng::literal!("istio-eastwest"),
+		}]
+	);
+	// Inner tunnel: waypoint workload id + waypoint service SANs.
+	assert_matches!(backend_call.transport_override, Some((InboundProtocol::HBONE, identities)) => {
+		assert_eq!(identities, vec![
+			Identity::Spiffe {
+				trust_domain: strng::EMPTY,
+				namespace: strng::literal!("default"),
+				service_account: strng::literal!("waypoint"),
+			},
+			Identity::Spiffe {
+				trust_domain: strng::literal!("td2"),
+				namespace: strng::literal!("default"),
+				service_account: strng::literal!("waypoint-san"),
+			},
+		]);
+	});
+	assert_matches!(backend_call.target, Target::Hostname(host, port) => {
+		assert_eq!(host.as_str(), "my-svc.default.svc.cluster.local");
+		assert_eq!(port, 80);
+	});
 }
 
 #[tokio::test]
@@ -3408,6 +5993,11 @@ async fn network_gateway_hostname_resolves_via_service_endpoint() {
 		hostname: gateway_hostname.clone(),
 		vips: vec![],
 		ports: std::collections::HashMap::from([(svc_port, gw_target_port)]),
+		subject_alt_names: vec![Identity::Spiffe {
+			trust_domain: strng::literal!("td-gw"),
+			namespace: gateway_namespace.clone(),
+			service_account: strng::literal!("gateway-san"),
+		}],
 		..Default::default()
 	};
 	let gw_wl = LocalWorkload {
@@ -3459,7 +6049,7 @@ async fn network_gateway_hostname_resolves_via_service_endpoint() {
 	)
 	.expect("build_service_call should succeed");
 
-	let (resolved_gw, gw_identity) = backend_call
+	let (resolved_gw, gw_identities) = backend_call
 		.network_gateway
 		.expect("network_gateway must be resolved for hostname-form destination");
 
@@ -3471,12 +6061,20 @@ async fn network_gateway_hostname_resolves_via_service_endpoint() {
 		resolved_gw.hbone_mtls_port, gw_target_port,
 		"port should be the endpoint target port, not the service port"
 	);
+	// Outer-tunnel identities match ztunnel: gateway workload id + gateway service SANs.
 	assert_eq!(
-		gw_identity,
-		Identity::Spiffe {
-			trust_domain: strng::EMPTY,
-			namespace: gateway_namespace.clone(),
-			service_account: strng::literal!("gateway-sa"),
-		},
+		gw_identities,
+		vec![
+			Identity::Spiffe {
+				trust_domain: strng::EMPTY,
+				namespace: gateway_namespace.clone(),
+				service_account: strng::literal!("gateway-sa"),
+			},
+			Identity::Spiffe {
+				trust_domain: strng::literal!("td-gw"),
+				namespace: gateway_namespace.clone(),
+				service_account: strng::literal!("gateway-san"),
+			},
+		]
 	);
 }

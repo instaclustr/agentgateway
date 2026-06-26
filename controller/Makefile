@@ -422,6 +422,35 @@ export AGENTGATEWAY_IMAGE_REPO ?= agentgateway-controller
 agentgateway-controller:
 	 $(GO_BUILD_FLAGS) GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(CONTROLLER_OUTPUT_DIR)/agentgateway-linux-$(GOARCH) ./cmd/agentgateway
 
+#----------------------------------------------------------------------------------
+# agctl CLI
+#----------------------------------------------------------------------------------
+
+AGCTL_OUTPUT_DIR=$(OUTPUT_DIR)/pkg/agctl
+
+.PHONY: agctl
+agctl: ## Build agctl for the host OS/arch
+	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(AGCTL_OUTPUT_DIR)/agctl-$(GOOS)-$(GOARCH) ./cmd/agctl
+
+.PHONY: agctl-linux-amd64
+agctl-linux-amd64: ## Build agctl for linux/amd64
+	CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(AGCTL_OUTPUT_DIR)/agctl-linux-amd64 ./cmd/agctl
+
+.PHONY: agctl-linux-arm64
+agctl-linux-arm64: ## Build agctl for linux/arm64
+	CGO_ENABLED=0 GOARCH=arm64 GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(AGCTL_OUTPUT_DIR)/agctl-linux-arm64 ./cmd/agctl
+
+.PHONY: agctl-darwin-arm64
+agctl-darwin-arm64: ## Build agctl for darwin/arm64
+	CGO_ENABLED=0 GOARCH=arm64 GOOS=darwin go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(AGCTL_OUTPUT_DIR)/agctl-darwin-arm64 ./cmd/agctl
+
+.PHONY: agctl-windows-amd64
+agctl-windows-amd64: ## Build agctl for windows/amd64
+	CGO_ENABLED=0 GOARCH=amd64 GOOS=windows go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(AGCTL_OUTPUT_DIR)/agctl-windows-amd64.exe ./cmd/agctl
+
+.PHONY: agctl-release
+agctl-release: agctl-linux-amd64 agctl-linux-arm64 agctl-darwin-arm64 agctl-windows-amd64 ## Build agctl for all release targets
+
 $(CONTROLLER_OUTPUT_DIR)/Dockerfile.agentgateway: cmd/agentgateway/Dockerfile.agentgateway
 	cp $< $@
 
@@ -480,10 +509,11 @@ HELM_PACKAGE_ARGS ?= --version $(HELM_CHART_VERSION_NO_V) --app-version $(HELM_C
 EXTRA_HELM_TAG ?=
 HELM_CHART_DIR_AGW=install/helm/agentgateway
 HELM_CHART_DIR_AGW_CRD=install/helm/agentgateway-crds
+HELM_CHART_DIR_AGW_STANDALONE=install/helm/agentgateway-standalone
 HELM_ADDITIONAL_VALUES ?= hack/helm/dev.yaml
 
 .PHONY: package-agentgateway-charts
-package-agentgateway-charts: package-agentgateway-chart package-agentgateway-crd-chart ## Package the agentgateway charts
+package-agentgateway-charts: package-agentgateway-chart package-agentgateway-crd-chart package-agentgateway-standalone-chart ## Package the agentgateway charts
 
 .PHONY: package-agentgateway-chart
 package-agentgateway-chart: ## Package the agentgateway chart
@@ -497,7 +527,13 @@ package-agentgateway-crd-chart: ## Package the agentgateway crd chart
 	$(HELM) package $(HELM_PACKAGE_ARGS) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_CRD); \
 	$(HELM) repo index $(TEST_ASSET_DIR);
 
-CHART_NAMES := agentgateway agentgateway-crds
+.PHONY: package-agentgateway-standalone-chart
+package-agentgateway-standalone-chart: ## Package the standalone agentgateway chart
+	mkdir -p $(TEST_ASSET_DIR); \
+	$(HELM) package $(HELM_PACKAGE_ARGS) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_STANDALONE); \
+	$(HELM) repo index $(TEST_ASSET_DIR);
+
+CHART_NAMES := agentgateway agentgateway-crds agentgateway-standalone
 
 .PHONY: release-charts
 release-charts: package-agentgateway-charts
@@ -507,12 +543,18 @@ release-charts: package-agentgateway-charts
 	mkdir -p $(TEST_ASSET_DIR); \
 	$(HELM) package --version $(HELM_CHART_VERSION_V) --app-version $(HELM_CHART_VERSION_V) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_CRD); \
 	$(HELM) repo index $(TEST_ASSET_DIR);
+	mkdir -p $(TEST_ASSET_DIR); \
+	$(HELM) package --version $(HELM_CHART_VERSION_V) --app-version $(HELM_CHART_VERSION_V) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_STANDALONE); \
+	$(HELM) repo index $(TEST_ASSET_DIR);
 	@if [ -n "$(EXTRA_HELM_TAG)" ]; then \
 		mkdir -p $(TEST_ASSET_DIR); \
 		$(HELM) package --version $(EXTRA_HELM_TAG) --app-version $(VERSION) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW); \
 		$(HELM) repo index $(TEST_ASSET_DIR); \
 		mkdir -p $(TEST_ASSET_DIR); \
 		$(HELM) package --version $(EXTRA_HELM_TAG) --app-version $(VERSION) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_CRD); \
+		$(HELM) repo index $(TEST_ASSET_DIR); \
+		mkdir -p $(TEST_ASSET_DIR); \
+		$(HELM) package --version $(EXTRA_HELM_TAG) --app-version $(VERSION) --destination $(TEST_ASSET_DIR) $(HELM_CHART_DIR_AGW_STANDALONE); \
 		$(HELM) repo index $(TEST_ASSET_DIR); \
 	fi
 	@for chart in $(CHART_NAMES); do \
@@ -540,6 +582,7 @@ deploy-agentgateway-chart: ## Deploy the agentgateway chart
 lint-charts: ## Lint the agentgateway charts
 	$(HELM) lint $(HELM_CHART_DIR_AGW)
 	$(HELM) lint $(HELM_CHART_DIR_AGW_CRD)
+	$(HELM) lint $(HELM_CHART_DIR_AGW_STANDALONE)
 
 #----------------------------------------------------------------------------------
 # Release
@@ -557,8 +600,8 @@ CLUSTER_NAME ?= kind
 INSTALL_NAMESPACE ?= agentgateway-system
 
 # The version of the Node Docker image to use for booting the kind cluster: https://hub.docker.com/r/kindest/node/tags
-# This version should stay in sync with `hack/kind/setup-kind.sh`.
-CLUSTER_NODE_VERSION ?= v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+# This version should stay in sync with the default node version in (controller)`test/setup/setup-kind-ci.sh`.
+CLUSTER_NODE_VERSION ?= v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
 
 .PHONY: kind-create
 kind-create: ## Create a KinD cluster
@@ -667,8 +710,11 @@ kind-load: kind-load-testbox
 #----------------------------------------------------------------------------------
 
 # Agent Gateway conformance test configuration
+AGW_CONFORMANCE_GATEWAY_CLASS ?= agentgateway
 AGW_CONFORMANCE_REPORT_ARGS ?= -report-output=$(TEST_ASSET_DIR)/conformance/agw-$(VERSION)-report.yaml -organization=agentgateway -project=agentgateway -version=$(VERSION) -url=github.com/agentgateway/agentgateway -contact=github.com/agentgateway/agentgateway/issues/new/choose
-AGW_CONFORMANCE_ARGS := -gateway-class=agentgateway $(AGW_CONFORMANCE_REPORT_ARGS)
+AGW_CONFORMANCE_SKIP_TESTS ?=
+AGW_CONFORMANCE_SKIP_ARGS := $(if $(AGW_CONFORMANCE_SKIP_TESTS),-skip-tests=$(AGW_CONFORMANCE_SKIP_TESTS))
+AGW_CONFORMANCE_ARGS := -gateway-class=$(AGW_CONFORMANCE_GATEWAY_CLASS) $(AGW_CONFORMANCE_REPORT_ARGS) $(AGW_CONFORMANCE_SKIP_ARGS)
 .PHONY: agw-conformance ## Run the agent gateway conformance test suite
 agw-conformance:
 	@mkdir -p $(TEST_ASSET_DIR)/conformance
@@ -688,8 +734,9 @@ GIE_CONFORMANCE_REPORT_ARGS ?= \
     -contact=github.com/agentgateway/agentgateway/issues/new/choose
 
 # The args to pass into the Gateway API Inference Extension conformance test suite.
+GIE_CONFORMANCE_GATEWAY_CLASS ?= agentgateway
 GIE_CONFORMANCE_ARGS := \
-    -gateway-class=agentgateway \
+    -gateway-class=$(GIE_CONFORMANCE_GATEWAY_CLASS) \
     $(GIE_CONFORMANCE_REPORT_ARGS)
 
 .PHONY: gie-conformance
