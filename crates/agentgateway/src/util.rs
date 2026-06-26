@@ -154,7 +154,7 @@ fn requires_parent_watch(path: &Path) -> anyhow::Result<bool> {
 		Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true),
 		Err(e) => return Err(e.into()),
 	};
-	Ok(meta.file_type().is_symlink() && is_kubernetes_projected_volume_symlink(path))
+	Ok(meta.is_file() || meta.file_type().is_symlink() && is_kubernetes_projected_volume_symlink(path))
 }
 
 fn is_kubernetes_projected_volume_symlink(path: &Path) -> bool {
